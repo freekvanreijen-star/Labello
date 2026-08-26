@@ -29,27 +29,23 @@
 /* ------------------------------------------------------------------ *
  *  MULTI-PHONE SYNC  (Firebase Realtime Database)                     *
  *                                                                     *
- *  >>> PASTE YOUR FIREBASE WEB CONFIG BELOW. <<<                      *
- *  Firebase console -> Project settings -> General -> Your apps       *
- *  -> Web app -> "SDK setup and configuration" -> Config.             *
- *                                                                     *
  *  This config is MEANT to be public. It identifies the project; it   *
  *  does not authorise anything. Access is controlled by the database  *
  *  rules in database.rules.json plus anonymous auth. (A *service      *
  *  account* key is a completely different thing and must never go in  *
  *  this repo.)                                                        *
  *                                                                     *
- *  Leave it as-is and the app still works fully in Single Phone       *
- *  mode -- only online rooms are disabled.                            *
+ *  Blank this out and the app still works fully in Single Phone      *
+ *  mode; only online rooms go away.                                   *
  * ------------------------------------------------------------------ */
 var LB_FIREBASE = {
-  apiKey: "PASTE_API_KEY",
-  authDomain: "PASTE.firebaseapp.com",
-  databaseURL: "https://PASTE-default-rtdb.europe-west1.firebasedatabase.app",
-  projectId: "PASTE",
-  storageBucket: "PASTE.firebasestorage.app",
-  messagingSenderId: "PASTE",
-  appId: "PASTE"
+  apiKey: "AIzaSyDQaMgQk7yk_2nMrRoG6N89EjYJyhSqCss",
+  authDomain: "labello-995fd.firebaseapp.com",
+  databaseURL: "https://labello-995fd-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "labello-995fd",
+  storageBucket: "labello-995fd.firebasestorage.app",
+  messagingSenderId: "153981262014",
+  appId: "1:153981262014:web:f7f6c63b84a2932b0466ef"
 };
 
 window.LBSync = (function () {
