@@ -65,21 +65,38 @@ window.LBSync = (function () {
     }
   }
 
-  /* Firebase turns arrays into objects with numeric keys, and drops empty
-     ones entirely. Everything read back out of the DB goes through this. */
+  /* Firebase turns arrays into objects with numeric keys, and drops anything
+     that serialises to empty -- an empty array included.
+     
+     Rebuilding by numeric key rather than compacting is load bearing. Cards
+     with no {placeholder} have an empty cast, so those indices disappeared on
+     the way into the database. Compacting what came back slid every later
+     cast up a slot, which handed cards the wrong names and left the tail with
+     no cast at all, rendering as "someone". In a 25 card game that was 11
+     cards showing "someone" and another 10 showing the wrong people.
+     Positions must survive the round trip. */
   function toArr(v) {
     if (Array.isArray(v)) return v;
     if (!v || typeof v !== "object") return [];
-    return Object.keys(v).sort(function (a, b) { return a - b; }).map(function (k) { return v[k]; });
+    var keys = Object.keys(v).filter(function (k) { return /^\d+$/.test(k); });
+    if (!keys.length) return [];
+    var max = keys.reduce(function (m, k) { return Math.max(m, +k); }, -1);
+    var out = new Array(max + 1);
+    for (var i = 0; i <= max; i++) out[i] = undefined;
+    keys.forEach(function (k) { out[+k] = v[k]; });
+    return out;
   }
+  var defined = function (x) { return x != null; };
   function norm(s) {
     if (!s) return null;
-    s.players = toArr(s.players);
-    s.pairs   = toArr(s.pairs).map(function (p) { return toArr(p); });
+    /* players and skips are not addressed by position, so dropping a gap is
+       safe. order and casts ARE addressed by position and must keep theirs. */
+    s.players = toArr(s.players).filter(defined);
+    s.pairs   = toArr(s.pairs).filter(defined).map(function (p) { return toArr(p); });
     s.order   = toArr(s.order);
     s.casts   = toArr(s.casts).map(function (c) { return toArr(c); });
-    s.rules   = toArr(s.rules);
-    s.skips   = toArr(s.skips);
+    s.rules   = toArr(s.rules).filter(defined);
+    s.skips   = toArr(s.skips).filter(defined);
     return s;
   }
 
@@ -252,7 +269,7 @@ const DECK = [
 ["dare",1,"{p}, sing the chorus of the last song you listened to."],
 
 ["drink",1,"Everyone wearing black, drink."],
-["drink",1,"Waterfall. {p} starts, and nobody stops until they do."],
+["drink",1,"Waterfall. Everyone drinks together and nobody may stop before {p} does."],
 ["drink",1,"{p}, hand out 3 sips however you like."],
 ["drink",1,"Everyone with a sibling, drink."],
 ["drink",1,"Last person to touch the floor drinks 2."],
@@ -413,7 +430,7 @@ const DECK = [
 ["truth",3,"{p}, pettiest reason you have ever ended things with someone?"],
 
 ["dare",3,"{p}, let {q} write a text to anyone in your phone. You do not get to read it first."],
-["dare",3,"{p}, whisper something to {q} that would make them blush. {q} rates it out of 10."],
+["dare",3,"{p}, whisper something to {q} that would make them blush. They rate it out of 10."],
 ["dare",3,"{p}, give {q} your best pickup line. Bad, drink 3."],
 ["dare",3,"{p}, take off one item of clothing. Shoes count. This once."],
 ["dare",3,"{p}, your best fake moan. The group rates it. Under 5, drink 3."],
@@ -523,7 +540,7 @@ const DECK = [
 ["drink",4,"Everyone who has lied in this game so far, drink 3. You know who you are."],
 ["drink",4,"{m} and {n}: drink from the same glass. Both drink 2."],
 ["drink",4,"Everyone with a secret they are not sharing tonight, drink 3."],
-["drink",4,"Waterfall, and nobody stops until {p} does. {p}, be cruel."],
+["drink",4,"Waterfall. Everyone drinks until {p} decides to stop. No mercy expected."],
 
 ["vote",4,"Point at whoever has the wildest history. They drink 3 or tell one story."],
 ["vote",4,"Point at whoever you would trust least with a secret. They drink 3."],
@@ -650,7 +667,7 @@ const DECK = [
 ["dare",5,"{p}, finish this game naked, or finish your drink right now."],
 ["dare",5,"{p}, show the group the part of yourself you are proudest of."],
 
-["phys",5,"{m}, spank {n} once. {n} decides how hard."],
+["phys",5,"{m}, spank {n} once. They decide how hard."],
 ["phys",5,"{m}, three spanks on {n}. The group counts them out loud."],
 ["phys",5,"{m}, lick {n} somewhere above the waist."],
 ["phys",5,"{n} picks a spot. {m}, lick it."],
@@ -658,7 +675,7 @@ const DECK = [
 ["phys",5,"{m}, kiss your way from {n}'s wrist up to their shoulder. Slowly."],
 ["phys",5,"{m}, take {n}'s hand and put it exactly where you want it."],
 ["phys",5,"{m}, straddle {n} until three cards have passed."],
-["phys",5,"{m}, pin {n} down for thirty seconds. {n} is allowed to struggle."],
+["phys",5,"{m}, pin {n} down for thirty seconds. They are allowed to struggle."],
 ["phys",5,"{m}, undress {n} down to their underwear."],
 ["phys",5,"{m}, {n} chooses one part of you to kiss for thirty seconds. No negotiating."],
 ["phys",5,"{m}, body shot off {n}. Anywhere they allow."],

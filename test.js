@@ -21,6 +21,11 @@ const {
 } = new Function(engineSrc +
   "return { DECK, buildGame, slotsOf, pairOf, poolSize };")();
 
+/* norm() and toArr() live in the sync layer, above the JSX. */
+const norm = new Function(
+  slice("  function toArr(v) {", "  var stateRef =") +
+  "return norm;")();
+
 let failures = [];
 const fail = (m) => failures.push(m);
 const seen = new Set();
@@ -64,6 +69,65 @@ DECK.forEach((c, i) => {
 
 const texts = DECK.map((c) => c[2]);
 new Set(texts).size === texts.length || fail(`duplicate card text (${texts.length - new Set(texts).size})`);
+
+/* ---------------------------------------------------------------- *
+ *  1b. Nobody plays two parts in one card                           *
+ *                                                                   *
+ *  A card that names the same person twice reads as a contradiction  *
+ *  ("Sam starts, and nobody stops until Sam says so"). Use a pronoun *
+ *  for the second mention instead.                                   *
+ * ---------------------------------------------------------------- */
+DECK.forEach((c) => {
+  const seen = {};
+  (c[2].match(/\{[pqrmn]\}/g) || []).forEach((ph) => { seen[ph] = (seen[ph] || 0) + 1; });
+  Object.keys(seen).forEach((ph) => {
+    if (seen[ph] > 1) fail(`repeats ${ph}, so one player fills two parts: "${c[2]}"`);
+  });
+});
+
+/* ---------------------------------------------------------------- *
+ *  1c. The state survives a Firebase round trip                     *
+ *                                                                   *
+ *  Firebase stores arrays as objects keyed by index and drops any    *
+ *  value that serialises to empty. Cards with no {placeholder} have  *
+ *  an empty cast, so those indices vanish on write. If the read side *
+ *  compacts what comes back, every later cast slides up a slot and   *
+ *  the tail renders as "someone". This is that exact trip.           *
+ * ---------------------------------------------------------------- */
+function likeFirebase(v) {
+  if (Array.isArray(v)) {
+    if (v.length === 0) return undefined;
+    const o = {};
+    v.forEach((item, i) => { const r = likeFirebase(item); if (r !== undefined) o[i] = r; });
+    return Object.keys(o).length ? o : undefined;
+  }
+  if (v && typeof v === "object") {
+    const o = {};
+    Object.keys(v).forEach((k) => { const r = likeFirebase(v[k]); if (r !== undefined) o[k] = r; });
+    return Object.keys(o).length ? o : undefined;
+  }
+  return v;
+}
+
+{
+  const players = [{ id: "a", name: "Sam", c: 0 }, { id: "b", name: "Lea", c: 1 }];
+  const g = buildGame(players, [["a", "b"]], 25, 5);
+  const state = {
+    v: 1, phase: "play", players, pairs: [["a", "b"]], cfg: { len: 25, maxHeat: 5 },
+    order: g.order, casts: g.casts, i: 0, skips: [], host: "a", ts: Date.now()
+  };
+  const back = norm(likeFirebase(state));
+
+  if (back.order.length !== g.order.length) fail(`order lost entries: ${back.order.length} of ${g.order.length}`);
+  for (let i = 0; i < g.order.length; i++) {
+    if (back.order[i] !== g.order[i]) fail(`order[${i}] shifted after a round trip`);
+    const want = JSON.stringify(g.casts[i]);
+    const got = JSON.stringify(back.casts[i] || []);
+    if (want !== got) fail(`casts[${i}] shifted after a round trip: ${want} became ${got}`);
+  }
+  if (back.players.length !== 2) fail("players lost entries in a round trip");
+  if (JSON.stringify(back.pairs) !== JSON.stringify([["a", "b"]])) fail("pairs mangled in a round trip");
+}
 
 /* ---------------------------------------------------------------- *
  *  2. Dealing invariants, across the whole settings matrix          *
