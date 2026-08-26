@@ -1514,16 +1514,9 @@ function End({ st, onAgain, onHome, canRestart }) {
             : skipped === 1 ? "One pass all night. Nearly flawless."
             : "" + skipped + " cards passed. Cowards, all of you."}
         </p>
-      </div>
-
-      <div className="lb-card" style={{ marginTop: 20 }}>
-        <h3>Tonight</h3>
-        <hr className="lb-hair" />
-        <p className="lb-note">
-          <b>{played}</b> cards played, peaking at <b>{HEATS[st.cfg.maxHeat]}</b>.<br />
-          <b>{st.players.length}</b> players, <b>{st.pairs.length}</b> matched
-          {st.pairs.length ? ": " + st.pairs.map((pr) =>
-            nameOf(st.players, pr[0]) + " + " + nameOf(st.players, pr[1])).join(", ") : ""}.<br />
+        {/* The matches and the level reached are deliberately not recapped:
+            the pairings stay the host's business even once the game is over. */}
+        <p className="lb-note" style={{ marginTop: 20 }}>
           There are <b>{DECK.length - played}</b> cards you have not seen yet.
         </p>
       </div>
