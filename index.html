@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#FFF0E9">
 <title>Labello</title>
-<meta name="description" content="A party game that gets closer as the night goes on.">
+<meta name="description" content="Labello. A drinking game.">
 <style>html,body,#root{margin:0;padding:0;background:#FFF0E9;min-height:100%}</style>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%92%8B</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -1138,7 +1138,7 @@ function Logo({ small }) {
         Lab<em>ello</em>
       </div>
       {!small && <div className="lb-kicker" style={{ marginTop: 6 }}>
-        The night gets closer &nbsp;&#128139;
+        Drinking game
       </div>}
     </div>
   );
@@ -1263,12 +1263,9 @@ function Settings({ cfg, setCfg, pairs, players }) {
 function Home({ onSolo, onCreate, onJoin, online }) {
   return (
     <div>
-      <div style={{ height: 12 }} />
+      <div style={{ height: 26 }} />
       <Logo />
-      <p className="lb-sub lb-center" style={{ margin: "0 auto 22px", maxWidth: 380 }}>
-        A drinking game that starts silly and does not stay that way.
-        Match people up first, and the game respects it.
-      </p>
+      <div style={{ height: 12 }} />
 
       <button className="lb-big" onClick={onSolo}>
         <span className="t">&#128241; &nbsp;One phone</span>
@@ -1288,20 +1285,8 @@ function Home({ onSolo, onCreate, onJoin, online }) {
         <span className="d">Got a four letter code? In you go.</span>
       </button>
 
-      <div className="lb-card" style={{ marginTop: 20 }}>
-        <h3>House rules</h3>
-        <hr className="lb-hair" />
-        <p className="lb-note">
-          <b>Pass whenever you want.</b> Every card has a Pass button and nobody
-          is allowed to make it weird. On the last level a pass costs you a chug
-          or three shots, but it never goes away. <br /><br />
-          <b>Matches are the boundary.</b> Anything past a hug only ever lands on
-          two people the host matched. <br /><br />
-          <b>18+.</b> Drink water, know your limits, and let someone sober hold the phone.
-        </p>
-      </div>
-      <p className="lb-tiny lb-center" style={{ marginTop: 18 }}>
-        {DECK.length} cards &middot; build {BUILD}
+      <p className="lb-tiny lb-center" style={{ marginTop: 22 }}>
+        {DECK.length} cards, build {BUILD}
       </p>
     </div>
   );
@@ -1559,25 +1544,14 @@ function End({ st, onAgain, onHome, canRestart }) {
  *  ENTRY SCREENS                                                      *
  * ================================================================== */
 
+/* Deliberately bare, at Sam's request: the logo and the one button. The button
+   label is now the only place the app states what you are agreeing to. */
 function Gate({ onOk }) {
   return (
     <div>
-      <div style={{ height: 30 }} />
+      <div style={{ height: 88 }} />
       <Logo />
-      <div className="lb-card" style={{ marginTop: 18 }}>
-        <h3>Before we start</h3>
-        <hr className="lb-hair" />
-        <p className="lb-note">
-          Labello is an adults only party game. It asks personal questions, and by
-          the last level it involves kissing, spanking and nudity between people
-          the host has matched.<br /><br />
-          Every card can be passed. At the top level a pass costs you a chug or
-          three shots, but it is always there, and nobody is ever made to do
-          anything. If someone is not up for it, that is the end of it. Look
-          after each other and drink water.
-        </p>
-      </div>
-      <div style={{ marginTop: 16 }}>
+      <div style={{ marginTop: 34 }}>
         <button className="lb-btn" onClick={onOk}>
           Everyone here is 18+ and up for it
         </button>
