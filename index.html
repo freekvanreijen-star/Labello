@@ -750,6 +750,14 @@ const CSS = `
 .lb-btn.gold.sm { box-shadow:0 3px 0 var(--goldDark); }
 .lb-btn.mint.sm { box-shadow:0 3px 0 var(--mintDark); }
 .lb-row { display:flex; gap:9px; }
+/* Deliberately a quiet link rather than a third button: at level 5 the Pass
+   label carries a subline, and a third button in that row wrapped it. */
+.lb-back { display:block; margin:14px auto 0; padding:6px 10px; background:none; border:0;
+  cursor:pointer; -webkit-tap-highlight-color:transparent; font-family:var(--body);
+  font-weight:800; font-size:13px; color:var(--violetDark); text-decoration:underline;
+  text-underline-offset:3px; text-decoration-thickness:2px; }
+.lb-back:active { opacity:.55; }
+.lb-back:focus-visible { outline:3px solid var(--violet); outline-offset:3px; border-radius:8px; }
 .lb-row > * { flex:1; }
 .lb-row.auto > * { flex:0 0 auto; }
 
@@ -879,8 +887,6 @@ const CSS = `
 .lb-meter i.on1{background:#00C2A8}.lb-meter i.on2{background:#3FA9F5}
 .lb-meter i.on3{background:#FFB020}.lb-meter i.on4{background:#FF3D71}.lb-meter i.on5{background:#9333EA}
 .lb-count { font-family:var(--disp); font-weight:600; font-size:15px; color:var(--dim); flex:none; }
-.lb-heatname { font-weight:900; font-size:11px; letter-spacing:.16em; text-transform:uppercase;
-  color:var(--pinkDark); }
 
 /* ---- active rules ---- */
 .lb-rules { background:var(--violetSoft); border:3px solid #C7B0FF; border-radius:16px;
@@ -1313,6 +1319,8 @@ function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave
   const joinUrl = code
     ? location.origin + location.pathname + "#" + code
     : null;
+  const enough = players.length >= 2;
+  const canEdit = solo || isHost;
 
   useEffect(() => {
     if (!joinUrl || !qrRef.current || typeof qrcode !== "function") return;
@@ -1338,8 +1346,6 @@ function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave
     });
   }
 
-  const enough = players.length >= 2;
-  const canEdit = solo || isHost;
 
   return (
     <div>
@@ -1380,7 +1386,10 @@ function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave
         <div className="lb-chips">
           {players.map((p) => (
             <Chip key={p.id} p={p}
-              partner={!!pairOf(pairs, p.id)}
+              /* Only whoever is doing the matching sees who is matched. A
+                 guest must not be able to read the pairings off the roster,
+                 not even their own. */
+              partner={canEdit && !!pairOf(pairs, p.id)}
               dim={!!code && !presence[p.id] && p.id !== meId}
               onClick={() => solo && removePlayer(p.id)} />
           ))}
@@ -1413,16 +1422,8 @@ function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave
           <div className="lb-blob">&#127864;</div>
           <h3 style={{ marginTop: 10 }}>You are in.</h3>
           <p className="lb-note" style={{ marginTop: 8 }}>
-            {nameOf(players, st.host)} is setting up the matches. Hold tight.
+            Waiting for {nameOf(players, st.host)} to start the night.
           </p>
-          {pairOf(pairs, meId) && (
-            <div className="lb-pair" style={{ marginTop: 14, justifyContent: "center" }}>
-              <span>&#128139;</span>
-              <span className="who" style={{ flex: "0 0 auto" }}>
-                You are matched with {nameOf(players, pairOf(pairs, meId))}
-              </span>
-            </div>
-          )}
         </div>
       )}
 
@@ -1439,7 +1440,7 @@ function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave
  *  PLAY                                                               *
  * ================================================================== */
 
-function Play({ st, meId, onNext, onPass, onQuit }) {
+function Play({ st, meId, onNext, onPass, onBack, onQuit }) {
   const i = st.i;
   const card = DECK[st.order[i]];
   const cast = st.casts[i] || [];
@@ -1449,7 +1450,6 @@ function Play({ st, meId, onNext, onPass, onQuit }) {
   const meta = TYPES[card[0]];
   const rules = activeRules(st.order, i);
   const onMe = meId && cast.indexOf(meId) >= 0;
-  const isPairCard = slotsOf(card[2]).indexOf("m") >= 0;
   const hardPass = heat >= HARD_HEAT;
 
   return (
@@ -1464,8 +1464,6 @@ function Play({ st, meId, onNext, onPass, onQuit }) {
         </div>
         <div className="lb-count">{i + 1}/{st.order.length}</div>
       </div>
-      <div className="lb-heatname lb-center" style={{ marginBottom: 10 }}>{HEATS[heat]}</div>
-
       {rules.length > 0 && (
         <div className="lb-rules">
           {rules.map((r, k) => (
@@ -1486,11 +1484,7 @@ function Play({ st, meId, onNext, onPass, onQuit }) {
             <span>{renderText(card, cast, st.players)}</span>
           </div>
           <div className="foot">
-            <span>
-              {isPairCard ? "\u{1F495} matched only"
-                : onMe ? "\u{1F449} that is you"
-                : ""}
-            </span>
+            <span>{onMe ? "\u{1F449} that is you" : ""}</span>
             <span className="tap">tap for next &#8594;</span>
           </div>
         </div>
@@ -1509,6 +1503,9 @@ function Play({ st, meId, onNext, onPass, onQuit }) {
           ? "A pass costs you now. Down your drink, or take 3 shots."
           : "Passing costs nothing. Take a sip if you feel like it."}
       </p>
+      {i > 0 && (
+        <button className="lb-back" onClick={onBack}>&#8592; Missed the last one?</button>
+      )}
     </div>
   );
 }
@@ -1670,11 +1667,21 @@ function App() {
   const stRef  = useRef(null);
   stRef.current = st;
 
-  /* A shared link lands on #ABCD -- jump straight to the join screen. */
+  /* A shared link lands on #ABCD, so jump straight to the join screen. The
+     hashchange listener matters as much as the mount check: if Labello is
+     already open in that browser tab, tapping the link only changes the hash
+     and never reloads, so without this nothing would happen. */
   useEffect(() => {
-    const h = (location.hash || "").replace("#", "").toUpperCase().replace(/[^A-Z]/g, "");
-    if (h.length === 4) { setHash(h); if (online) setRoute("join"); }
-  }, []); // eslint-disable-line
+    const readHash = () => {
+      const h = (location.hash || "").replace("#", "").toUpperCase().replace(/[^A-Z]/g, "");
+      if (h.length !== 4 || h === code) return;
+      setHash(h);
+      if (online) setRoute("join");
+    };
+    readHash();
+    window.addEventListener("hashchange", readHash);
+    return () => window.removeEventListener("hashchange", readHash);
+  }, [online, code]);
 
   /* Live room state + who is currently connected. */
   useEffect(() => {
@@ -1776,6 +1783,29 @@ function App() {
     }
   }
 
+  /* Step back one card. Active rules are derived from the position rather than
+     stored, so they recompute on their own. A card you had passed stops
+     counting as passed once you return to it. */
+  function back() {
+    const s = stRef.current;
+    if (!s || s.phase !== "play" || s.i <= 0) return;
+    const seen = s.i;
+    const apply = (x) => ({
+      ...x,
+      i: x.i - 1,
+      skips: (x.skips || []).filter((k) => k !== x.i - 1),
+      ts: Date.now()
+    });
+    if (code) {
+      LBSync.tx(code, (cur) => {
+        if (!cur || cur.phase !== "play" || cur.i !== seen || cur.i <= 0) return undefined;
+        return apply(cur);
+      });
+    } else {
+      setStRaw(apply(s));
+    }
+  }
+
   function quit() {
     const s = stRef.current;
     const host = solo || (s && s.host === meId);
@@ -1822,7 +1852,7 @@ function App() {
   );
 
   if (st.phase === "play") return shell(
-    <Play st={st} meId={meId}
+    <Play st={st} meId={meId} onBack={back}
       onNext={() => advance(false)} onPass={() => advance(true)} onQuit={quit} />
   );
 
