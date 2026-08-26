@@ -1,0 +1,25 @@
+{
+  "rules": {
+    "rooms": {
+      "$code": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "state": {
+          ".validate": "newData.hasChildren(['phase', 'players', 'ts'])",
+          "phase": { ".validate": "newData.isString() && newData.val().length < 12" },
+          "players": {
+            "$i": {
+              ".validate": "newData.hasChildren(['id', 'name'])",
+              "name": { ".validate": "newData.isString() && newData.val().length <= 14" }
+            }
+          }
+        },
+        "presence": {
+          "$pid": {
+            ".validate": "!newData.exists() || newData.hasChildren(['name', 't'])"
+          }
+        }
+      }
+    }
+  }
+}

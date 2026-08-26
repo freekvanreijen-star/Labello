@@ -1,0 +1,1764 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#FFF0E9">
+<title>Labello</title>
+<meta name="description" content="A party game that gets closer as the night goes on.">
+<style>html,body,#root{margin:0;padding:0;background:#FFF0E9;min-height:100%}</style>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%92%8B</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+<!-- All CDN versions are PINNED on purpose. An unpinned @babel/standalone once
+     shipped Babel 8, whose react preset emits an ESM import into a classic
+     script, and the page rendered blank. Do not loosen these. -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js" crossorigin></script>
+<script src="https://unpkg.com/qrcode-generator@1.4.4/qrcode.js" crossorigin></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+/* ------------------------------------------------------------------ *
+ *  MULTI-PHONE SYNC  (Firebase Realtime Database)                     *
+ *                                                                     *
+ *  >>> PASTE YOUR FIREBASE WEB CONFIG BELOW. <<<                      *
+ *  Firebase console -> Project settings -> General -> Your apps       *
+ *  -> Web app -> "SDK setup and configuration" -> Config.             *
+ *                                                                     *
+ *  This config is MEANT to be public. It identifies the project; it   *
+ *  does not authorise anything. Access is controlled by the database  *
+ *  rules in database.rules.json plus anonymous auth. (A *service      *
+ *  account* key is a completely different thing and must never go in  *
+ *  this repo.)                                                        *
+ *                                                                     *
+ *  Leave it as-is and the app still works fully in Single Phone       *
+ *  mode -- only online rooms are disabled.                            *
+ * ------------------------------------------------------------------ */
+var LB_FIREBASE = {
+  apiKey: "PASTE_API_KEY",
+  authDomain: "PASTE.firebaseapp.com",
+  databaseURL: "https://PASTE-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "PASTE",
+  storageBucket: "PASTE.firebasestorage.app",
+  messagingSenderId: "PASTE",
+  appId: "PASTE"
+};
+
+window.LBSync = (function () {
+  var ok = false, db = null, authP = null;
+  var configured = LB_FIREBASE.apiKey.indexOf("PASTE") !== 0;
+
+  if (configured) {
+    try {
+      firebase.initializeApp(LB_FIREBASE);
+      db = firebase.database();
+      authP = firebase.auth().signInAnonymously().catch(function (e) {
+        console.warn("[lb] anonymous auth failed:", e && e.code);
+      });
+      ok = true;
+    } catch (e) {
+      console.warn("[lb] firebase unavailable:", e);
+    }
+  }
+
+  /* Firebase turns arrays into objects with numeric keys, and drops empty
+     ones entirely. Everything read back out of the DB goes through this. */
+  function toArr(v) {
+    if (Array.isArray(v)) return v;
+    if (!v || typeof v !== "object") return [];
+    return Object.keys(v).sort(function (a, b) { return a - b; }).map(function (k) { return v[k]; });
+  }
+  function norm(s) {
+    if (!s) return null;
+    s.players = toArr(s.players);
+    s.pairs   = toArr(s.pairs).map(function (p) { return toArr(p); });
+    s.order   = toArr(s.order);
+    s.casts   = toArr(s.casts).map(function (c) { return toArr(c); });
+    s.rules   = toArr(s.rules);
+    s.skips   = toArr(s.skips);
+    return s;
+  }
+
+  var stateRef = function (c) { return db.ref("rooms/" + c + "/state"); };
+
+  return {
+    available: function () { return ok; },
+    ready: function () { return authP || Promise.resolve(); },
+    norm: norm,
+
+    create: function (code, state) {
+      return (authP || Promise.resolve()).catch(function () {})
+        .then(function () { return stateRef(code).set(state); })
+        .then(function () { return true; })
+        .catch(function (e) { console.warn("[lb] create failed:", e); return false; });
+    },
+
+    get: function (code) {
+      return stateRef(code).once("value").then(function (s) { return norm(s.val()); })
+        .catch(function () { return null; });
+    },
+
+    write: function (code, state) {
+      /* Wait for the anonymous session before writing. The rules require
+         auth, so a write that raced sign-in would be rejected outright. */
+      return (authP || Promise.resolve()).catch(function () {})
+        .then(function () { return stateRef(code).set(state); })
+        .catch(function (e) { console.warn("[lb] write failed:", e); });
+    },
+
+    /* Atomic join. Firebase retries this against fresh data on conflict, so
+       two phones tapping Join at the same instant cannot clobber each other
+       -- which is what a plain read-modify-write would do. */
+    join: function (code, player) {
+      return (authP || Promise.resolve()).catch(function () {})
+        .then(function () {
+          return stateRef(code).transaction(function (cur) {
+            if (cur === null) return cur;                // no such room
+            var s = norm(cur);
+            if (s.phase !== "lobby") return;             // abort: already started
+            if (s.players.length >= 16) return;          // abort: full
+            var dup = s.players.filter(function (p) { return p.id === player.id; }).length;
+            if (!dup) {
+              player.c = s.players.length % 8;
+              s.players.push(player);
+            }
+            s.ts = Date.now();
+            return s;
+          });
+        }).then(function (r) {
+          if (!r.committed) return { ok: false, room: norm(r.snapshot && r.snapshot.val()) };
+          return { ok: true, room: norm(r.snapshot.val()) };
+        }).catch(function (e) {
+          console.warn("[lb] join failed:", e);
+          return { ok: false, room: null, err: e };
+        });
+    },
+
+    /* Read-modify-write of the live state, retried against fresh data on
+       conflict. Advancing a card goes through this so that four people
+       tapping Next at once still only moves the game on by one. */
+    tx: function (code, mutate) {
+      return (authP || Promise.resolve()).catch(function () {})
+        .then(function () {
+          return stateRef(code).transaction(function (cur) {
+            if (cur === null) return cur;
+            return mutate(norm(cur));
+          });
+        })
+        .catch(function (e) { console.warn("[lb] tx failed:", e); });
+    },
+
+    subscribe: function (code, cb) {
+      var r = stateRef(code);
+      var h = r.on("value", function (s) { cb(norm(s.val())); });
+      return function () { r.off("value", h); };
+    },
+
+    /* Presence lives outside /state so that rewriting the game state on
+       every card does not wipe it. */
+    presence: function (code, id, name) {
+      var p = db.ref("rooms/" + code + "/presence/" + id);
+      p.onDisconnect().remove();
+      p.set({ name: name, t: firebase.database.ServerValue.TIMESTAMP });
+      return function () { try { p.remove(); } catch (e) {} };
+    },
+
+    watchPresence: function (code, cb) {
+      var r = db.ref("rooms/" + code + "/presence");
+      var h = r.on("value", function (s) { cb(s.val() || {}); });
+      return function () { r.off("value", h); };
+    }
+  };
+})();
+</script>
+
+<script>
+  /* Belt and braces: pin the JSX runtime to classic explicitly, so a future
+     Babel major cannot silently blank the page. */
+  Babel.registerPreset("lb-react", {
+    presets: [[Babel.availablePresets["react"], { runtime: "classic" }]]
+  });
+</script>
+<script type="text/babel" data-presets="lb-react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+const BUILD = "L1";
+
+/* ================================================================== *
+ *  THE DECK                                                           *
+ *                                                                     *
+ *  [type, heat, text, ruleDuration?]                                   *
+ *                                                                     *
+ *  type  nhie | truth | dare | phys | drink | vote | rule | game | group
+ *  heat  1 warm-up . 2 loosening up . 3 spicy . 4 hot . 5 filthy       *
+ *                                                                     *
+ *  Placeholders -- requirements are DERIVED from these, so a card that *
+ *  cannot be cast is simply never dealt. Do not add flags by hand.     *
+ *    {p} {q} {r}  distinct random players  (q needs 2+, r needs 3+)    *
+ *    {m} {n}      a MATCHED pair          (needs 1+ matched pair)      *
+ *                                                                     *
+ *  {m}/{n} is the consent boundary: anything past a hug uses it, so    *
+ *  those cards only ever land on people the host paired up. Hugs and   *
+ *  friendly contact use {p}/{q} and can hit anyone.                    *
+ *                                                                     *
+ *  Card order is load-bearing for nothing -- rooms store card objects  *
+ *  by index into a per-game pre-rolled order, so appending, inserting  *
+ *  and reordering are all safe between games.                          *
+ * ================================================================== */
+const DECK = [
+
+/* ---------------- HEAT 1 . WARM-UP ---------------- */
+["nhie",1,"Never have I ever fallen asleep in a cinema."],
+["nhie",1,"Never have I ever pretended to know a song I had never heard."],
+["nhie",1,"Never have I ever eaten food off the floor."],
+["nhie",1,"Never have I ever gone a full day without brushing my teeth."],
+["nhie",1,"Never have I ever broken a bone."],
+["nhie",1,"Never have I ever been on TV."],
+["nhie",1,"Never have I ever lied about my age."],
+["nhie",1,"Never have I ever sung karaoke completely sober."],
+["nhie",1,"Never have I ever left a party without saying goodbye to anyone."],
+["nhie",1,"Never have I ever cried at a cartoon."],
+["nhie",1,"Never have I ever googled my own name."],
+["nhie",1,"Never have I ever forgotten someone's name mid-conversation."],
+["nhie",1,"Never have I ever faked a phone call to escape a conversation."],
+["nhie",1,"Never have I ever eaten an entire pizza by myself."],
+["nhie",1,"Never have I ever been pulled over by the police."],
+["nhie",1,"Never have I ever laughed so hard I snorted."],
+
+["truth",1,"{p}, what is the last thing you searched on your phone?"],
+["truth",1,"{p}, how many alarms are set on your phone right now?"],
+["truth",1,"{p}, what is your most used emoji? Prove it."],
+["truth",1,"{p}, worst haircut you have ever had?"],
+["truth",1,"{p}, a song you are secretly embarrassed to love?"],
+["truth",1,"{p}, what is your screen time this week? Read it out loud."],
+["truth",1,"{p}, what is the pettiest reason you have stopped talking to someone?"],
+["truth",1,"{p}, what is the weirdest thing in your bag or pockets right now?"],
+["truth",1,"{p}, who here would you call at 3am, and why them?"],
+["truth",1,"{p}, what is the last lie you told?"],
+
+["dare",1,"{p}, speak in a foreign accent until your next card."],
+["dare",1,"{p}, do your best impression of {q}. If nobody laughs, drink 2."],
+["dare",1,"{p}, show everyone the last photo in your camera roll."],
+["dare",1,"{p}, ten push-ups or drink 3. Your call."],
+["dare",1,"{p}, hold a plank until the next card, or drink 2 now."],
+["dare",1,"{p}, let {q} pick one emoji you must reply with to everything for 3 cards."],
+["dare",1,"{p}, read your last text message out loud in a dramatic voice."],
+["dare",1,"{p}, thirty seconds of your best runway walk. Go."],
+["dare",1,"{p}, name five things in this room in five seconds. Fail, drink 2."],
+["dare",1,"{p}, sing the chorus of the last song you listened to."],
+
+["drink",1,"Everyone wearing black, drink."],
+["drink",1,"Waterfall. {p} starts, and nobody stops until they do."],
+["drink",1,"{p}, hand out 3 sips however you like."],
+["drink",1,"Everyone with a sibling, drink."],
+["drink",1,"Last person to touch the floor drinks 2."],
+["drink",1,"Everyone drinks. No reason. Cheers."],
+["drink",1,"{p} picks a category. Go round the circle, first to blank drinks 2."],
+["drink",1,"Anyone driving tonight: sip water and hand out 2 real ones. Legend."],
+["drink",1,"The youngest person here drinks."],
+["drink",1,"Everyone whose phone is under 50 percent battery, drink."],
+["drink",1,"Everyone who has been on holiday this year, drink. Everyone who has not, drink 2."],
+["drink",1,"{p}, pick a drinking twin for the next 5 cards. When you drink, they drink."],
+
+["vote",1,"Point at the most likely to be late to their own wedding. Most votes drinks 2."],
+["vote",1,"Point at the most likely to be famous one day. Most votes hands out 3 sips."],
+["vote",1,"Point at the best cook here. They hand out 2 sips."],
+["vote",1,"Point at whoever survives the zombie apocalypse. Everyone else drinks."],
+["vote",1,"Point at the worst taste in music. They drink 2."],
+["vote",1,"Point at the most likely to text an ex tonight. They drink 2."],
+["vote",1,"Point at the biggest phone addict. Their phone goes in the middle for 5 cards."],
+["vote",1,"Point at whoever gives the best advice. They drink for their wisdom."],
+
+["rule",1,"No first names. Slip up and drink.",6],
+["rule",1,"Everyone drinks with their non-dominant hand.",6],
+["rule",1,"No swearing. At all.",6],
+["rule",1,"Say 'cheers' before every single sip.",5],
+["rule",1,"Nobody may point with their fingers. Elbows only.",5],
+
+["game",1,"{p} and {q}: staring contest. First to blink or laugh drinks 2."],
+["game",1,"{p} and {q}: thumb war. Loser drinks 2."],
+["game",1,"{p} and {q}: rock paper scissors, best of three. Loser drinks 2."],
+["game",1,"Count to 20 out loud together, one voice at a time, no order. Two at once, everyone drinks."],
+["game",1,"{p} starts a story with one sentence. Round the circle. First to stall drinks 2."],
+["game",1,"{p} and {q}: arm wrestle. Loser drinks 2."],
+
+["phys",1,"{p}, give {q} a proper hug. Three full seconds, no back-patting."],
+["phys",1,"Group hug. Right now. Someone take a photo."],
+["phys",1,"{p}, give {q} a genuine compliment and a high five."],
+
+["group",1,"Everyone show your lock screen. Ugliest drinks 2."],
+["group",1,"On three, everyone point at the funniest person here. Most points hands out 3 sips."],
+["group",1,"Everyone name one thing they are grateful for. Anyone who cannot think of one drinks 2."],
+["group",1,"Everyone stand and swap seats. Last one seated drinks 2."],
+
+/* ---------------- HEAT 2 . LOOSENING UP ---------------- */
+["nhie",2,"Never have I ever been kicked out of a bar or club."],
+["nhie",2,"Never have I ever sent a text to the wrong person and regretted it."],
+["nhie",2,"Never have I ever stalked someone's profile for over an hour."],
+["nhie",2,"Never have I ever had a crush on a friend's partner."],
+["nhie",2,"Never have I ever ghosted someone."],
+["nhie",2,"Never have I ever been ghosted."],
+["nhie",2,"Never have I ever gone skinny dipping."],
+["nhie",2,"Never have I ever kissed someone in this room."],
+["nhie",2,"Never have I ever lied to get out of plans with someone here."],
+["nhie",2,"Never have I ever thrown up from drinking."],
+["nhie",2,"Never have I ever been caught by my parents doing something I should not have been."],
+["nhie",2,"Never have I ever had a nickname I hated."],
+["nhie",2,"Never have I ever cried in a public toilet."],
+["nhie",2,"Never have I ever pretended to be someone else online."],
+["nhie",2,"Never have I ever danced on a table."],
+["nhie",2,"Never have I ever woken up with no idea how I got there."],
+
+["truth",2,"{p}, what is the biggest lie you have told your parents?"],
+["truth",2,"{p}, who was your first crush?"],
+["truth",2,"{p}, what is the most embarrassing thing in your search history?"],
+["truth",2,"{p}, worst first date. Go."],
+["truth",2,"{p}, who here would you swap lives with for a week, and why?"],
+["truth",2,"{p}, what is a rumour you have heard about yourself?"],
+["truth",2,"{p}, most money you have ever spent on something stupid?"],
+["truth",2,"{p}, what is your toxic trait? Everyone has to agree, or you drink 2."],
+["truth",2,"{p}, who here would you trust with your phone unlocked for an hour?"],
+["truth",2,"{p}, what is the worst thing you have ever said to someone?"],
+["truth",2,"{p}, describe your type in three words."],
+["truth",2,"{p}, what is something you have never told anyone in this room?"],
+
+["dare",2,"{p}, let {q} read out your last three texts."],
+["dare",2,"{p}, post a photo of this group to your story right now."],
+["dare",2,"{p}, text your mum 'I need to tell you something' and explain nothing for 3 cards. Or drink 4."],
+["dare",2,"{p}, fifteen seconds of your most seductive dance. No music. Or drink 3."],
+["dare",2,"{p}, let the group rename {q} in your phone contacts."],
+["dare",2,"{p}, speak only in questions until your next card. Slip up, drink 2."],
+["dare",2,"{p}, call the third person in your recent calls and tell them you love them."],
+["dare",2,"{p}, swap one item of clothing with {q}. Shoes, jackets, hats, dealer's choice."],
+["dare",2,"{p}, let {q} draw something on your arm. No looking until they are done."],
+["dare",2,"{p}, impersonate someone here until it is guessed. Nobody guesses, drink 3."],
+["dare",2,"{p}, ten seconds of your camera roll for the whole group. Or drink 5."],
+["dare",2,"{p}, hold {q}'s hand until three more cards have passed."],
+
+["phys",2,"{p}, give {q} a twenty-second shoulder massage."],
+["phys",2,"{p} and {q}: back to back, link arms, stand up together. Fail, both drink 2."],
+["phys",2,"{p}, carry {q} across the room. Piggyback counts. Or both drink 3."],
+["phys",2,"{p}, rest your head on {q}'s shoulder until the next card."],
+["phys",2,"{p}, sit on the floor. {q} has to get you up using one hand only."],
+["phys",2,"{p} and {q}: hug, then rate it out of 10 at the same time. Different numbers, both drink 2."],
+["phys",2,"Everyone hug the person on your left. Any half-hug, drink 2."],
+["phys",2,"{p}, piggyback {q} once around the circle."],
+
+["drink",2,"Everyone who has kissed someone in this room, drink 2."],
+["drink",2,"Everyone single, drink. Everyone taken, hand out 2."],
+["drink",2,"{p}, name someone here you could never share a flat with. You both drink."],
+["drink",2,"Everyone who has been in love, drink 2."],
+["drink",2,"{p}, get down to your last third, or hand out 4 sips."],
+["drink",2,"Everyone with an ex they would still text, drink 2."],
+["drink",2,"Categories. {p} picks. First to repeat or blank drinks 3."],
+["drink",2,"Everyone who has opened a dating app this month, drink 2."],
+["drink",2,"{p} and {q}: cheers, both drink. You are allies now, every card that hits one hits both, for 4 cards."],
+["drink",2,"Everyone who has ever sent a risky text, drink 2."],
+
+["vote",2,"Point at the biggest flirt. They drink 2."],
+["vote",2,"Point at the best kisser here. No evidence required. They hand out 3."],
+["vote",2,"Point at the most likely to marry first. They drink."],
+["vote",2,"Point at the messiest drunk. They drink 2."],
+["vote",2,"Point at the most likely to end up in a police station. They drink 2."],
+["vote",2,"Point at your road trip pick. Most points hands out 3."],
+["vote",2,"Point at whoever is hiding something tonight. They drink 2."],
+["vote",2,"Point at the best dressed. They hand out 3 sips."],
+
+["rule",2,"Nobody may say the word 'drink'. Say 'sip' instead.",6],
+["rule",2,"{p} is the Bartender. Nobody drinks without their permission.",6],
+["rule",2,"Every time you laugh, you drink.",4],
+["rule",2,"No phones out. Caught, drink 3.",8],
+
+["game",2,"{p} and {q}: thirty seconds of eye contact without laughing. Loser drinks 3."],
+["game",2,"{p} and {q}: on three, name someone you both find attractive. Same name, everyone else drinks 2. Different, you both drink 2."],
+["game",2,"{p}, {q} and {r}: last one sitting on the floor drinks 3."],
+["game",2,"On three, everyone point at who they want on their team in a fight. Fewest points drinks 3."],
+["game",2,"{p} whispers a word to {q}, who acts it out. Group guesses. Fail, both drink 2."],
+
+["group",2,"Everyone reveal who you last texted. Most boring answer drinks 2."],
+["group",2,"Everyone say the first name that comes to mind for 'trouble'. Any repeat, both drink."],
+["group",2,"Everyone hold up how many people you have kissed on your fingers. Highest hands out 3, lowest drinks 2."],
+
+/* ---------------- HEAT 3 . SPICY ---------------- */
+["nhie",3,"Never have I ever had a one night stand."],
+["nhie",3,"Never have I ever sent a nude."],
+["nhie",3,"Never have I ever kissed someone on a first date."],
+["nhie",3,"Never have I ever had a crush on someone in this room."],
+["nhie",3,"Never have I ever faked it."],
+["nhie",3,"Never have I ever kissed two different people in one night."],
+["nhie",3,"Never have I ever cheated on someone."],
+["nhie",3,"Never have I ever been cheated on."],
+["nhie",3,"Never have I ever hooked up with a coworker or classmate."],
+["nhie",3,"Never have I ever done it somewhere I could have been caught."],
+["nhie",3,"Never have I ever had a friends-with-benefits situation."],
+["nhie",3,"Never have I ever gone home with someone I met that night."],
+["nhie",3,"Never have I ever used a dating app while in a relationship."],
+["nhie",3,"Never have I ever kissed someone whose name I did not know."],
+
+["truth",3,"{p}, if you had to kiss one person in this room, who? Answer or drink 4."],
+["truth",3,"{p}, biggest turn-off?"],
+["truth",3,"{p}, strangest place you have been kissed?"],
+["truth",3,"{p}, how old were you for your first kiss, and how bad was it?"],
+["truth",3,"{p}, rate {q} out of 10. You have to justify it."],
+["truth",3,"{p}, a fantasy you would actually admit to in this room?"],
+["truth",3,"{p}, best kiss of your life. What made it good?"],
+["truth",3,"{p}, boldest thing you have done to get someone's attention?"],
+["truth",3,"{p}, what is the most attractive thing about {q}?"],
+["truth",3,"{p}, have you ever thought about someone here in a way you should not have? Answer or drink 4."],
+["truth",3,"{p}, your number. Round it if you like. Or drink 5."],
+["truth",3,"{p}, pettiest reason you have ever ended things with someone?"],
+
+["dare",3,"{p}, let {q} write a text to anyone in your phone. You do not get to read it first."],
+["dare",3,"{p}, whisper something to {q} that would make them blush. {q} rates it out of 10."],
+["dare",3,"{p}, give {q} your best pick-up line. Bad, drink 3."],
+["dare",3,"{p}, take off one item of clothing. Shoes count. This once."],
+["dare",3,"{p}, your best fake moan. The group rates it. Under 5, drink 3."],
+["dare",3,"{p}, let {q} feed you something with your eyes closed."],
+["dare",3,"{p}, describe {q}'s smile for twenty seconds without stopping."],
+["dare",3,"{p}, order a pizza out loud in your most convincing bedroom voice."],
+["dare",3,"{p}, show the group the face you make when you are into someone."],
+["dare",3,"{p}, slow dance with {q} for thirty seconds. Someone hum something."],
+["dare",3,"{p}, tell {q} something you have always wanted to say to them."],
+["dare",3,"{p}, let the group ask one question you cannot dodge. Dodge it, drink 4."],
+
+["phys",3,"{p}, give {q} a thirty-second back massage. Properly."],
+["phys",3,"{p} and {q}: hug for fifteen seconds. No talking. Anyone who laughs drinks 2."],
+["phys",3,"{p}, hold {q} like a film poster. Hold it for a photo."],
+["phys",3,"{p}, sit back to back with {q} until three cards have passed."],
+["phys",3,"{p}, rest your head in {q}'s lap for the next two cards."],
+["phys",3,"{m}, kiss {n} on the cheek."],
+["phys",3,"{m}, kiss {n} on the neck. Three seconds."],
+["phys",3,"{m}, sit on {n}'s lap until the next card."],
+["phys",3,"{m}, kiss {n} anywhere above the shoulders. Your choice."],
+["phys",3,"{m} and {n}: forehead to forehead, eyes closed, until the next card."],
+["phys",3,"{m}, whisper to {n} what you would do to them later. Nobody else hears it."],
+["phys",3,"{m}, kiss {n} on the lips. Two seconds. Yes, really."],
+
+["drink",3,"Everyone who has had a one night stand, drink 2."],
+["drink",3,"Everyone who has thought about someone in this room, drink 3. No confessing."],
+["drink",3,"{p}, drink once for every person here you find attractive. Nobody gets to know who."],
+["drink",3,"Everyone who has sent a nude, drink 2. Everyone who has received one, drink 1."],
+["drink",3,"Everyone wearing something they would be embarrassed to reveal, drink 3."],
+["drink",3,"{p} and {q}: sip at the same time, eyes locked. Whoever breaks first drinks 3 more."],
+["drink",3,"Everyone who has kissed more than twenty people, drink 3."],
+["drink",3,"Everyone in a relationship drinks 2. Everyone who wishes they were drinks 3."],
+
+["vote",3,"Point at whoever you would have a one-night stand with if nobody ever found out. Most points drinks 3."],
+["vote",3,"Point at the best body in the room. They hand out 4 sips."],
+["vote",3,"Point at whoever has the most secrets. They drink 3."],
+["vote",3,"Point at whoever is secretly into something weird. They drink 3."],
+["vote",3,"Point at the biggest tease. They drink 2 and owe someone a compliment."],
+["vote",3,"Point at whoever you would swipe right on as a stranger. Most points hands out 4."],
+
+["rule",3,"Every time you drink you must make eye contact with someone.",6],
+["rule",3,"{p} and {q} must stay touching for the rest of this rule. Break it, both drink 2.",10],
+["rule",3,"No compliments. Only affectionate insults.",5],
+
+["game",3,"{p} and {q}: eye contact until the next card. Whoever breaks drinks 3."],
+["game",3,"{p} and {q}: pass a card mouth to mouth, no hands. Drop it, both drink 3."],
+["game",3,"{p} and {q}: whoever holds the hug longest wins. Everyone else counts out loud."],
+["game",3,"{p}, guess {q}'s worst habit. Wrong, you drink 3. Right, they drink 3."],
+["game",3,"{m}, close your eyes. {n} touches your face with one finger. Guess which finger. Wrong, drink 3."],
+
+["group",3,"Everyone say the age of your first kiss at the same time. Youngest hands out 3."],
+["group",3,"Everyone write down the name of someone here you would kiss. Read them out. Any match, both drink 3 and owe the group a story."],
+["group",3,"Everyone show a photo with someone you have dated. Nothing to show, drink 3."],
+["group",3,"Everyone hold up fingers for how spicy they want tonight. The lowest number rules the next 5 cards."],
+
+/* ---------------- HEAT 4 . HOT ---------------- */
+["nhie",4,"Never have I ever done it in a public place."],
+["nhie",4,"Never have I ever had a threesome."],
+["nhie",4,"Never have I ever used handcuffs or a blindfold."],
+["nhie",4,"Never have I ever sent a video I would be terrified to have leaked."],
+["nhie",4,"Never have I ever had a hookup I regretted by morning."],
+["nhie",4,"Never have I ever slept with someone and told nobody."],
+["nhie",4,"Never have I ever faked being asleep to avoid it."],
+["nhie",4,"Never have I ever been walked in on."],
+["nhie",4,"Never have I ever had feelings for someone in this room."],
+["nhie",4,"Never have I ever wanted a night to end differently than it did."],
+
+["truth",4,"{p}, wildest place you have ever done it?"],
+["truth",4,"{p}, something you want to try but have never asked for?"],
+["truth",4,"{p}, who here has the best mouth? Answer honestly."],
+["truth",4,"{p}, biggest secret you are keeping from someone in this room?"],
+["truth",4,"{p}, one to ten, how attracted are you to {q}? No lying."],
+["truth",4,"{p}, what is your safe word? No safe word, invent it now and it is yours forever."],
+["truth",4,"{p}, best night of your life. Skip nothing important."],
+["truth",4,"{p}, what would you do to {q} if nobody was watching? Answer or lose an item."],
+["truth",4,"{p}, the one thing that always works on you?"],
+["truth",4,"{p}, was there ever someone here you wanted something with and it never happened? Who?"],
+
+["dare",4,"{p}, take off one item of clothing. Your choice, but it has to actually come off."],
+["dare",4,"{p}, {q} chooses one item of your clothing to remove. Nothing you would regret."],
+["dare",4,"{p}, thirty seconds of your best lap dance. In the air, no contact. Everyone rates it."],
+["dare",4,"{p}, show your most flattering photo of yourself and take a compliment from every single person."],
+["dare",4,"{p}, the group asks one question you cannot refuse. Refuse, down your drink."],
+["dare",4,"{m}, kiss {n} for five seconds. Someone count."],
+["dare",4,"{m}, kiss {n} on the neck, and do not rush it."],
+["dare",4,"{m}, take off one item of {n}'s clothing. They pick which."],
+["dare",4,"{m}, sit facing {n} and mirror everything they do for thirty seconds."],
+["dare",4,"{m} and {n}: kiss with your eyes open. First to laugh drinks 3."],
+["dare",4,"{m}, kiss {n} somewhere you have not kissed them tonight."],
+["dare",4,"{m} and {n}: leave the room together for sixty seconds. What happens is your business."],
+
+["phys",4,"{p}, hug {q} from behind and stay there until the next card."],
+["phys",4,"{p}, let {q} rest their head on you until three cards have passed."],
+["phys",4,"{p} and {q}: slow dance properly for one minute. Someone put something on."],
+["phys",4,"{m}, kiss {n} for as long as it takes the group to count to seven."],
+["phys",4,"{m}, run your hands through {n}'s hair for thirty seconds."],
+["phys",4,"{m}, kiss {n}'s hand, then their wrist, then stop. Just stop there."],
+["phys",4,"{m} and {n}: face to face, eye contact, one full minute. No talking."],
+["phys",4,"{m}, trace one finger along {n}'s arm until the next card."],
+["phys",4,"{m}, kiss {n} anywhere you like. Nobody gets to comment."],
+["phys",4,"{m} and {n}: kiss. Whoever breaks it first drinks 4."],
+
+["drink",4,"Everyone still fully dressed, drink 2."],
+["drink",4,"Everyone who has thought about leaving with someone tonight, drink 3."],
+["drink",4,"{p}, down your drink or lose an item of clothing."],
+["drink",4,"Everyone who has had more than one person in the same week, drink 3."],
+["drink",4,"Everyone who has lied in this game so far, drink 3. You know who you are."],
+["drink",4,"{m} and {n}: drink from the same glass. Both drink 2."],
+["drink",4,"Everyone with a secret they are not sharing tonight, drink 3."],
+["drink",4,"Waterfall, and nobody stops until {p} does. {p}, be cruel."],
+
+["vote",4,"Point at whoever has the wildest history. They drink 3 or tell one story."],
+["vote",4,"Point at whoever you would trust least with a secret. They drink 3."],
+["vote",4,"Point at who you would want to be stuck in a lift with. They hand out 4."],
+["vote",4,"Point at the most likely to leave with someone tonight. They drink 3."],
+["vote",4,"Point at the biggest coward this game. They take the next card, whatever it is."],
+
+["rule",4,"Nobody sits alone. Everyone must be touching at least one other person.",8],
+["rule",4,"Any card you skip costs an item of clothing instead of a drink.",6],
+["rule",4,"{m} and {n} may not speak to anyone but each other.",6],
+
+["game",4,"{m} and {n}: kiss until the group says it is enough. The group is not merciful."],
+["game",4,"{p} and {q}: knee to knee, take turns saying something true about the other. First to hesitate drinks 4."],
+["game",4,"{m}, close your eyes. {n} kisses you somewhere. Guess where. Wrong, drink 3."],
+["game",4,"{p}, {q} and {r}: last one to take off an item of clothing drinks 4."],
+
+["group",4,"On three, everyone takes off one item of clothing. Together."],
+["group",4,"Everyone whisper to the person on your left the thing you have been thinking all night."],
+["group",4,"Everyone rate the night out of 10 right now. Lowest score picks who the next card lands on."],
+
+/* ---------------- HEAT 5 . FILTHY ---------------- */
+["nhie",5,"Never have I ever wanted to kiss someone in this room in the last ten minutes."],
+["nhie",5,"Never have I ever done something tonight I will think about tomorrow."],
+["nhie",5,"Never have I ever kept a photo I should have deleted."],
+["nhie",5,"Never have I ever been in love with two people at once."],
+["nhie",5,"Never have I ever done something I have never admitted to anyone."],
+["nhie",5,"Never have I ever broken a rule of this game already."],
+["nhie",5,"Never have I ever lied in a game like this."],
+["nhie",5,"Never have I ever left with someone I should not have."],
+
+["truth",5,"{p}, what would you do tonight if there were no consequences?"],
+["truth",5,"{p}, who here have you thought about the most? Say the name or down your drink."],
+["truth",5,"{p}, filthiest thought you have had in the last hour?"],
+["truth",5,"{p}, tell {q} exactly what you find attractive about them. Details."],
+["truth",5,"{p}, what would make tonight perfect? Be specific."],
+["truth",5,"{p}, the thing you have never asked for but always wanted?"],
+["truth",5,"{m}, tell {n} what you want to happen after this game. Out loud."],
+["truth",5,"{p}, biggest risk you would take right now?"],
+
+["dare",5,"{p}, take off one item of clothing. No negotiating."],
+["dare",5,"{p}, the group picks one item of clothing you lose."],
+["dare",5,"{m}, kiss {n} for ten seconds. Nobody counts out loud. You will know."],
+["dare",5,"{m}, take off one item of {n}'s clothing with your teeth. Or you both drink 5."],
+["dare",5,"{m} and {n}: two minutes alone. Timer starts now."],
+["dare",5,"{m}, kiss {n} somewhere that gets a reaction. The group judges the reaction."],
+["dare",5,"{m}, blindfold {n} and kiss them three times in three different places."],
+["dare",5,"{m} and {n}: swap one item of clothing and wear it for the rest of the game."],
+["dare",5,"{m}, sit on {n}'s lap facing them until three cards have passed."],
+["dare",5,"{m} and {n}: the group counts to twenty. Do what you like with it."],
+
+["phys",5,"{m} and {n}: kiss until someone else in this room says stop."],
+["phys",5,"{m}, kiss {n}'s neck until they tell you to stop."],
+["phys",5,"{m} and {n}: forehead to forehead, hands where you like, until the next card."],
+["phys",5,"{m}, hands on {n} anywhere above the waist for thirty seconds."],
+["phys",5,"{m} and {n}: a kiss with no rules and no time limit. Everyone else, drink and look away."],
+["phys",5,"{m}, hold {n} however you want. Nobody says a word for one minute."],
+["phys",5,"{m} and {n}: dance together, close, one full song."],
+["phys",5,"{m}, kiss {n} the way you would if this room were empty."],
+
+["drink",5,"Everyone still wearing shoes, drink 3."],
+["drink",5,"{p}, down your drink. That is the whole card."],
+["drink",5,"Everyone who wants this to keep going, drink 2. Everyone who has had enough, drink 3 and say so."],
+["drink",5,"Everyone not currently touching another person, drink 3."],
+["drink",5,"{m} and {n}: both finish whatever is left."],
+["drink",5,"Everyone who has broken a rule tonight, drink 4. Be honest."],
+["drink",5,"Everyone drinks. Everyone. This is the last stretch."],
+["drink",5,"{p}, hand out 6 sips. Make enemies."],
+
+["vote",5,"Point at whoever has had the best night. They hand out 5."],
+["vote",5,"Point at whoever should have taken more risks. They take the next two cards."],
+["vote",5,"Point at whoever you would want to stay after everyone leaves. Most points drinks 4."],
+["vote",5,"Point at whoever has surprised you most tonight. They hand out 4."],
+
+["rule",5,"Every card counts double for the rest of this rule.",8],
+["rule",5,"Nobody leaves the circle. Anyone who does drinks 4 on return.",8],
+
+["game",5,"{m} and {n}: the group counts down from ten. Whatever is happening at zero, stops."],
+["game",5,"{p} and {q}: last one to look away drinks 5."],
+["game",5,"{m} and {n}: one whispered truth each that nobody else will ever hear."],
+["game",5,"Everyone closes their eyes. {p} taps the shoulder of whoever they would kiss. Only they will know."],
+
+["group",5,"Everyone say one thing you want to happen before the night ends."],
+["group",5,"Everyone take one last drink and one last look around. This is the peak."],
+["group",5,"Everyone confess one thing you held back this game. Anyone who passes drinks 5."]
+];
+
+/* ================================================================== *
+ *  LOOK & FEEL                                                        *
+ *  Warm blush paper, candy stickers, chunky pressable everything.     *
+ *  Heat is communicated by COLOUR: the card face runs mint -> sky ->  *
+ *  gold -> coral -> violet as the night escalates, so you can feel    *
+ *  the game heating up without reading a number.                      *
+ * ================================================================== */
+const CSS = `
+.lb *, .lb *::before, .lb *::after { box-sizing: border-box; }
+.lb {
+  --paper:#FFF0E9; --paper2:#FFF8F4; --panel:#FFFFFF; --panel2:#FFF4EE;
+  --line:#F6D9CB; --edge:#EFA98C; --edgeDeep:#D98A6B;
+  --ink:#3A2430; --dim:#7A5F6C; --faint:#B79AA6;
+  --pink:#FF3D71; --pinkDark:#D81E56; --pinkSoft:#FFD9E4;
+  --violet:#7C4DFF; --violetDark:#5B2FD6; --violetSoft:#E6DCFF;
+  --gold:#FFB020; --goldDark:#DB8C00;
+  --mint:#00C2A8; --mintDark:#009683;
+  --sky:#3FA9F5; --skyDark:#2683C9;
+  --disp:"Fredoka",ui-rounded,"Trebuchet MS",system-ui,sans-serif;
+  --body:"Nunito",ui-rounded,-apple-system,"Segoe UI",Roboto,sans-serif;
+  background:
+    radial-gradient(115% 70% at 50% -10%, #FFD6E4 0%, rgba(255,240,233,0) 60%),
+    radial-gradient(80% 50% at 105% 100%, #E3D8FF 0%, rgba(255,240,233,0) 55%),
+    radial-gradient(70% 45% at -8% 78%, #FFE7C4 0%, rgba(255,240,233,0) 55%),
+    var(--paper);
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: var(--body);
+  min-height: 100vh; min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+}
+.lb-wrap { max-width: 560px; margin:0 auto; padding: 20px 16px calc(40px + env(safe-area-inset-bottom)); }
+.lb h1,.lb h2,.lb h3 { margin:0; font-family:var(--disp); font-weight:600; line-height:1.08; }
+.lb p { margin:0; }
+
+/* ---- logo ---- */
+.lb-logo { font-family:var(--disp); font-weight:600; font-size:clamp(52px,17vw,92px);
+  line-height:.92; color:var(--pink); text-shadow:3px 3px 0 #FFC2D5, 6px 6px 0 rgba(216,30,86,.16);
+  letter-spacing:-.02em; }
+.lb-logo em { font-style:normal; color:var(--violet); text-shadow:3px 3px 0 #D9C9FF; }
+.lb-kicker { font-weight:900; font-size:11px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--violetDark); }
+.lb-sub { color:var(--dim); font-size:15px; font-weight:700; line-height:1.55; }
+.lb-center { text-align:center; }
+
+/* ---- surfaces ---- */
+.lb-card { background:var(--panel); border:3px solid var(--edge); border-radius:24px;
+  padding:16px; box-shadow:0 5px 0 #F2C3AB; }
+.lb-card + .lb-card { margin-top:14px; }
+.lb-card h3 { font-size:20px; }
+.lb-hair { height:3px; background:var(--line); border-radius:3px; margin:12px 0; border:0; }
+
+/* ---- buttons ---- */
+.lb-btn { width:100%; border:3px solid var(--pinkDark); border-radius:18px; padding:14px 16px;
+  font-family:var(--disp); font-weight:600; font-size:20px; background:var(--pink); color:#fff;
+  cursor:pointer; -webkit-tap-highlight-color:transparent; box-shadow:0 5px 0 var(--pinkDark);
+  transition:transform .08s ease, box-shadow .08s ease; }
+.lb-btn:active { transform:translateY(4px); box-shadow:0 1px 0 var(--pinkDark); }
+.lb-btn:disabled { opacity:.4; cursor:default; transform:none; }
+.lb-btn.violet { background:var(--violet); border-color:var(--violetDark); box-shadow:0 5px 0 var(--violetDark); }
+.lb-btn.violet:active { box-shadow:0 1px 0 var(--violetDark); }
+.lb-btn.gold { background:var(--gold); border-color:var(--goldDark); box-shadow:0 5px 0 var(--goldDark); color:#4A2E00; }
+.lb-btn.gold:active { box-shadow:0 1px 0 var(--goldDark); }
+.lb-btn.mint { background:var(--mint); border-color:var(--mintDark); box-shadow:0 5px 0 var(--mintDark); color:#04322C; }
+.lb-btn.mint:active { box-shadow:0 1px 0 var(--mintDark); }
+.lb-btn.ghost { background:var(--panel); border-color:var(--edge); box-shadow:0 5px 0 #F2C3AB; color:var(--dim); }
+.lb-btn.ghost:active { box-shadow:0 1px 0 #F2C3AB; }
+.lb-btn.sm { padding:9px 13px; font-size:15px; border-radius:14px; width:auto; border-width:2px;
+  box-shadow:0 3px 0 var(--pinkDark); }
+.lb-btn.sm:active { transform:translateY(2px); box-shadow:0 1px 0 var(--pinkDark); }
+.lb-btn.ghost.sm { box-shadow:0 3px 0 #F2C3AB; }
+.lb-btn.violet.sm { box-shadow:0 3px 0 var(--violetDark); }
+.lb-btn.gold.sm { box-shadow:0 3px 0 var(--goldDark); }
+.lb-btn.mint.sm { box-shadow:0 3px 0 var(--mintDark); }
+.lb-row { display:flex; gap:9px; }
+.lb-row > * { flex:1; }
+.lb-row.auto > * { flex:0 0 auto; }
+
+/* ---- home: big stacked choices ---- */
+.lb-big { width:100%; text-align:left; border:3px solid var(--pinkDark); border-radius:22px;
+  padding:16px 18px; background:var(--pink); color:#fff; cursor:pointer; display:block;
+  -webkit-tap-highlight-color:transparent; box-shadow:0 6px 0 var(--pinkDark);
+  transition:transform .08s ease, box-shadow .08s ease; }
+.lb-big:active { transform:translateY(5px); box-shadow:0 1px 0 var(--pinkDark); }
+.lb-big:disabled { opacity:.5; }
+.lb-big .t { display:block; font-family:var(--disp); font-weight:600; font-size:25px; line-height:1.15; }
+.lb-big .d { display:block; font-size:13.5px; font-weight:700; margin-top:3px; opacity:.93; line-height:1.42; }
+.lb-big.violet { background:var(--violet); border-color:var(--violetDark); box-shadow:0 6px 0 var(--violetDark); }
+.lb-big.violet:active { box-shadow:0 1px 0 var(--violetDark); }
+.lb-big.gold { background:var(--gold); border-color:var(--goldDark); box-shadow:0 6px 0 var(--goldDark); color:#4A2E00; }
+.lb-big.gold:active { box-shadow:0 1px 0 var(--goldDark); }
+.lb-big + .lb-big { margin-top:12px; }
+
+/* ---- inputs ---- */
+.lb-input { width:100%; background:var(--paper2); border:3px solid var(--edge); border-radius:16px;
+  padding:13px 14px; color:var(--ink); font-size:16px; font-family:var(--body); font-weight:700; outline:none; }
+.lb-input::placeholder { color:#CBB0A2; }
+.lb-input:focus-visible, .lb-btn:focus-visible, .lb-big:focus-visible, .lb-chip:focus-visible {
+  outline:3px solid var(--violet); outline-offset:3px; }
+.lb-code-in { text-transform:uppercase; letter-spacing:.32em; text-align:center;
+  font-family:var(--disp); font-size:30px; font-weight:600; padding:12px; }
+
+/* ---- player chips ---- */
+.lb-chips { display:flex; flex-wrap:wrap; gap:8px; }
+.lb-chip { display:inline-flex; align-items:center; gap:7px; border-radius:999px; padding:7px 12px 7px 8px;
+  font-weight:800; font-size:14.5px; border:3px solid; cursor:pointer; background:var(--panel);
+  -webkit-tap-highlight-color:transparent; transition:transform .08s ease; font-family:var(--body); }
+.lb-chip:active { transform:scale(.95); }
+.lb-chip .dot { width:22px; height:22px; border-radius:50%; display:grid; place-items:center;
+  font-size:12px; font-weight:900; color:#fff; flex:none; }
+.lb-chip .x { font-size:16px; opacity:.5; line-height:1; }
+.lb-chip.sel { transform:scale(1.04); box-shadow:0 0 0 4px var(--violetSoft); }
+.lb-chip.paired { background:var(--pinkSoft); }
+.lb-chip .heart { font-size:13px; }
+
+/* player palette */
+.c0{--pc:#FF3D71}.c1{--pc:#7C4DFF}.c2{--pc:#00C2A8}.c3{--pc:#FFB020}
+.c4{--pc:#3FA9F5}.c5{--pc:#FF7043}.c6{--pc:#EC4899}.c7{--pc:#22C55E}
+.lb-chip{border-color:var(--pc);color:var(--pc)} .lb-chip .dot{background:var(--pc)}
+
+/* ---- pair rows ---- */
+.lb-pair { display:flex; align-items:center; gap:8px; background:var(--pinkSoft);
+  border:3px solid #FFB3C9; border-radius:16px; padding:8px 10px; font-weight:800; font-size:14.5px; }
+.lb-pair + .lb-pair { margin-top:8px; }
+.lb-pair .who { flex:1; color:var(--pinkDark); }
+.lb-pair button { border:0; background:transparent; font-size:18px; cursor:pointer; opacity:.55; padding:2px 4px; }
+
+/* ---- segmented control ---- */
+.lb-seg { display:flex; gap:6px; }
+.lb-seg button { flex:1; border:3px solid var(--edge); background:var(--panel); border-radius:14px;
+  padding:9px 6px; font-family:var(--disp); font-weight:600; font-size:14.5px; color:var(--dim);
+  cursor:pointer; -webkit-tap-highlight-color:transparent; box-shadow:0 3px 0 #F2C3AB;
+  transition:transform .08s ease, box-shadow .08s ease; }
+.lb-seg button:active { transform:translateY(2px); box-shadow:0 1px 0 #F2C3AB; }
+.lb-seg button.on { background:var(--violet); border-color:var(--violetDark); color:#fff;
+  box-shadow:0 3px 0 var(--violetDark); }
+.lb-seg.heat button.on { background:var(--pink); border-color:var(--pinkDark); box-shadow:0 3px 0 var(--pinkDark); }
+.lb-label { font-weight:900; font-size:11px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--violetDark); margin-bottom:8px; }
+
+/* ---- toggle ---- */
+.lb-toggle { display:flex; align-items:center; gap:12px; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+.lb-toggle .sw { width:56px; height:32px; border-radius:999px; background:#EBD5C8; border:3px solid var(--edge);
+  position:relative; flex:none; transition:background .15s ease; }
+.lb-toggle .sw::after { content:""; position:absolute; top:2px; left:2px; width:22px; height:22px;
+  border-radius:50%; background:#fff; box-shadow:0 2px 4px rgba(0,0,0,.2); transition:transform .15s ease; }
+.lb-toggle.on .sw { background:var(--mint); border-color:var(--mintDark); }
+.lb-toggle.on .sw::after { transform:translateX(24px); }
+.lb-toggle .tx { font-weight:800; font-size:14.5px; line-height:1.35; }
+.lb-toggle .tx small { display:block; font-weight:700; font-size:12.5px; color:var(--dim); margin-top:2px; }
+
+/* ================= THE PLAY CARD ================= */
+.lb-stage { position:relative; margin:14px 0 16px; }
+/* Two sheets peeking out from under the live card. They are absolutely
+   positioned siblings of .lb-face, so without the z-index the ::after would
+   paint straight over the card face. */
+.lb-stage::before, .lb-stage::after { content:""; position:absolute; inset:0; border-radius:28px;
+  border:3px solid rgba(58,36,48,.10); background:rgba(255,255,255,.55); z-index:0; }
+.lb-stage::before { transform:rotate(-2.6deg); }
+.lb-stage::after  { transform:rotate(2deg); }
+
+/* White sticker border rather than a translucent dark one: over a gradient,
+   rgba black reads as a second card peeking out from behind the first. */
+.lb-face { position:relative; z-index:1; border-radius:28px; border:5px solid #fff;
+  padding:22px 20px 20px; min-height:352px; display:flex; flex-direction:column;
+  color:#fff; cursor:pointer; -webkit-tap-highlight-color:transparent;
+  box-shadow:0 7px 0 rgba(122,62,94,.22), 0 20px 40px rgba(90,40,70,.22);
+  animation:lbIn .3s cubic-bezier(.2,1.3,.4,1) both; overflow:hidden; }
+.lb-face:active { transform:translateY(4px); box-shadow:0 3px 0 rgba(122,62,94,.22), 0 14px 26px rgba(90,40,70,.22); }
+@keyframes lbIn { from { opacity:0; transform:translateY(18px) scale(.95) rotate(-1.5deg); } }
+.lb-face::after { content:""; position:absolute; top:-40%; left:-25%; width:80%; height:150%;
+  background:linear-gradient(100deg, rgba(255,255,255,.22), rgba(255,255,255,0) 60%);
+  transform:rotate(12deg); pointer-events:none; }
+
+.h1{background:linear-gradient(155deg,#4BE3CB 0%,#00B79E 62%,#00937F 100%)}
+.h2{background:linear-gradient(155deg,#6EC6FF 0%,#3F91E8 60%,#2A6FC4 100%)}
+.h3{background:linear-gradient(155deg,#FFD25C 0%,#FF9E3D 60%,#F27A1E 100%)}
+.h4{background:linear-gradient(155deg,#FF8A8A 0%,#FF4470 58%,#E0215B 100%)}
+.h5{background:linear-gradient(155deg,#FF4FA8 0%,#B23BEA 55%,#6D28D9 100%)}
+
+.lb-face .badge { display:inline-flex; align-items:center; gap:7px; align-self:flex-start;
+  background:rgba(255,255,255,.24); border:2px solid rgba(255,255,255,.5); border-radius:999px;
+  padding:6px 13px 6px 10px; font-weight:900; font-size:11.5px; letter-spacing:.14em;
+  text-transform:uppercase; backdrop-filter:blur(3px); position:relative; z-index:1; }
+.lb-face .badge .e { font-size:15px; letter-spacing:0; }
+.lb-face .txt { flex:1; display:flex; align-items:center; padding:20px 0 12px; position:relative; z-index:1; }
+.lb-face .txt span { font-family:var(--disp); font-weight:600; font-size:clamp(25px,6.6vw,33px);
+  line-height:1.22; text-shadow:0 2px 10px rgba(0,0,0,.18); }
+.lb-face .nm { background:rgba(255,255,255,.95); color:#3A2430; border-radius:9px;
+  padding:0 8px; box-shadow:0 2px 0 rgba(0,0,0,.16); display:inline-block; }
+.lb-face .foot { display:flex; align-items:center; justify-content:space-between; gap:10px;
+  font-weight:800; font-size:12.5px; opacity:.92; position:relative; z-index:1;
+  border-top:2px solid rgba(255,255,255,.28); padding-top:12px; }
+.lb-face .tap { display:flex; align-items:center; gap:6px; animation:lbNudge 1.7s ease-in-out infinite; }
+@keyframes lbNudge { 0%,100%{transform:translateX(0)} 50%{transform:translateX(4px)} }
+
+/* ---- heat meter ---- */
+.lb-hud { display:flex; align-items:center; gap:10px; }
+.lb-meter { flex:1; display:flex; gap:4px; }
+.lb-meter i { flex:1; height:11px; border-radius:999px; background:#F0D8CB;
+  border:2px solid rgba(58,36,48,.1); transition:background .3s ease; }
+.lb-meter i.on1{background:#00C2A8}.lb-meter i.on2{background:#3FA9F5}
+.lb-meter i.on3{background:#FFB020}.lb-meter i.on4{background:#FF3D71}.lb-meter i.on5{background:#9333EA}
+.lb-count { font-family:var(--disp); font-weight:600; font-size:15px; color:var(--dim); flex:none; }
+.lb-heatname { font-weight:900; font-size:11px; letter-spacing:.16em; text-transform:uppercase;
+  color:var(--pinkDark); }
+
+/* ---- active rules ---- */
+.lb-rules { background:var(--violetSoft); border:3px solid #C7B0FF; border-radius:16px;
+  padding:10px 12px; margin-bottom:12px; }
+.lb-rules .r { font-weight:800; font-size:13.5px; line-height:1.4; color:#4C2A9E; display:flex; gap:7px; }
+.lb-rules .r + .r { margin-top:6px; }
+.lb-rules .n { flex:none; font-weight:900; opacity:.6; font-size:12px; padding-top:1px; }
+
+/* ---- misc ---- */
+.lb-codebox { text-align:center; background:var(--violetSoft); border:3px dashed #B79BFF;
+  border-radius:20px; padding:14px; }
+.lb-codebox .code { font-family:var(--disp); font-weight:600; font-size:46px; letter-spacing:.16em;
+  color:var(--violetDark); line-height:1; }
+.lb-qr { display:grid; place-items:center; padding:12px; }
+.lb-qr img, .lb-qr canvas { width:168px; height:168px; image-rendering:pixelated;
+  border:5px solid #fff; border-radius:14px; box-shadow:0 4px 0 #E4CEBF; }
+.lb-note { font-size:12.5px; font-weight:700; color:var(--dim); line-height:1.5; }
+.lb-warn { background:#FFF3D6; border:3px solid #FFCF6B; border-radius:16px; padding:12px;
+  font-weight:800; font-size:13.5px; color:#7A5300; line-height:1.5; }
+.lb-dead { text-align:center; padding:26px 10px; }
+.lb-tiny { font-size:11.5px; font-weight:800; color:var(--faint); letter-spacing:.04em; }
+.lb-blob { font-size:56px; line-height:1; }
+.lb-scroll { max-height:210px; overflow-y:auto; }
+.lb-badgecount { display:inline-block; background:var(--pink); color:#fff; border-radius:999px;
+  padding:2px 9px; font-weight:900; font-size:12px; margin-left:6px; }
+.lb-empty { text-align:center; color:var(--faint); font-weight:800; font-size:13.5px; padding:14px 6px; }
+@media (prefers-reduced-motion: reduce) {
+  .lb-face, .lb-face .tap { animation:none; }
+}
+`;
+
+/* ================================================================== *
+ *  ENGINE                                                             *
+ * ================================================================== */
+
+const TYPES = {
+  nhie:  { e:"\u{1F645}", label:"Never have I ever" },
+  truth: { e:"\u{1F4AC}", label:"Truth" },
+  dare:  { e:"\u{1F3AF}", label:"Dare" },
+  phys:  { e:"\u{1F48B}", label:"Contact" },
+  drink: { e:"\u{1F37B}", label:"Drink" },
+  vote:  { e:"\u{1F449}", label:"Vote" },
+  rule:  { e:"\u{1F4DC}", label:"New rule" },
+  game:  { e:"\u{1F3B2}", label:"Mini game" },
+  group: { e:"\u{1F46F}", label:"Everyone" }
+};
+const HEATS = ["", "Warm-up", "Loosening up", "Spicy", "Hot", "Filthy"];
+const HEAT_BLURB = ["",
+  "Icebreakers and easy sips.",
+  "Bolder questions, friendly contact.",
+  "Flirty. First kisses between matches.",
+  "Kissing, clothing, real confessions.",
+  "No brakes. Matched pairs only, mostly."];
+const LENGTHS = [
+  { k:"short",  n:25, label:"Short",    d:"~20 min" },
+  { k:"normal", n:40, label:"Normal",   d:"~35 min" },
+  { k:"long",   n:60, label:"Long",     d:"~1 hour" },
+  { k:"epic",   n:90, label:"Marathon", d:"all night" }
+];
+
+/* Which placeholders a card actually uses, in canonical order. The cast
+   array written to the DB lines up with this, so it must stay stable. */
+const SLOT_ORDER = ["p", "q", "r", "m", "n"];
+function slotsOf(text) {
+  return SLOT_ORDER.filter(function (s) { return text.indexOf("{" + s + "}") >= 0; });
+}
+
+function shuffle(a) {
+  a = a.slice();
+  for (var i = a.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var t = a[i]; a[i] = a[j]; a[j] = t;
+  }
+  return a;
+}
+const pick = (a) => a[Math.floor(Math.random() * a.length)];
+
+/* How many cards of each heat, for a game of `len` cards capped at `maxHeat`.
+   Slightly front-loaded: the warm-up matters, the filthy end should feel
+   earned and short rather than a long plateau. */
+function heatPlan(len, maxHeat) {
+  const base = [22, 22, 21, 19, 16].slice(0, maxHeat);
+  const sum = base.reduce((a, b) => a + b, 0);
+  const counts = base.map((w) => Math.max(1, Math.round((w / sum) * len)));
+  let drift = counts.reduce((a, b) => a + b, 0) - len;
+  /* Reconcile rounding against the *hottest* levels first, so shortening a
+     game trims the tail rather than the warm-up. */
+  for (let g = 0; drift !== 0 && g < 500; g++) {
+    const i = drift > 0 ? counts.length - 1 - (g % counts.length)
+                        : (g % counts.length);
+    if (drift > 0 && counts[i] > 1) { counts[i]--; drift--; }
+    else if (drift < 0) { counts[i]++; drift++; }
+  }
+  const plan = [];
+  counts.forEach((c, i) => { for (let k = 0; k < c; k++) plan.push(i + 1); });
+  return plan;
+}
+
+/* Can this card be cast with the roster we have? */
+function castable(card, nPlayers, nPairs) {
+  const s = slotsOf(card[2]);
+  if (s.indexOf("m") >= 0 && nPairs < 1) return false;
+  if (s.indexOf("r") >= 0 && nPlayers < 3) return false;
+  if (s.indexOf("q") >= 0 && nPlayers < 2) return false;
+  return nPlayers >= 1;
+}
+
+/* How many cards this exact roster + cap can actually draw from. Used to warn
+   the host when they ask for a longer game than the settings can fill. */
+function poolSize(players, pairs, maxHeat) {
+  return DECK.filter((c) => c[1] <= maxHeat && castable(c, players.length, pairs.length)).length;
+}
+
+/* Fill a card's slots with actual player ids. {m}/{n} always resolve to a
+   real matched pair -- that is the whole consent mechanism, so it must never
+   silently fall back to random players. */
+function castFor(card, players, pairs) {
+  const s = slotsOf(card[2]);
+  const out = [];
+  if (s.indexOf("m") >= 0) {
+    const pr = pick(pairs);
+    const flip = Math.random() < 0.5;
+    s.forEach(function (slot) {
+      if (slot === "m") out.push(flip ? pr[0] : pr[1]);
+      else if (slot === "n") out.push(flip ? pr[1] : pr[0]);
+    });
+    return out;
+  }
+  const pool = shuffle(players.map((p) => p.id));
+  s.forEach(function (_, i) { out.push(pool[i]); });
+  return out;
+}
+
+/* Pre-roll the whole game up front. Every phone then reads the same order
+   out of the database, so nothing has to agree on randomness at play time. */
+function buildGame(players, pairs, len, maxHeat) {
+  const plan = heatPlan(len, maxHeat);
+  const nP = players.length, nPr = pairs.length;
+
+  /* Bucket playable card indices by heat once. */
+  const byHeat = {};
+  DECK.forEach(function (c, i) {
+    if (c[1] > maxHeat) return;
+    if (!castable(c, nP, nPr)) return;
+    (byHeat[c[1]] = byHeat[c[1]] || []).push(i);
+  });
+  Object.keys(byHeat).forEach(function (h) { byHeat[h] = shuffle(byHeat[h]); });
+
+  const used = {}, order = [], casts = [], recent = [];
+  function take(h) {
+    const bucket = byHeat[h];
+    if (!bucket || !bucket.length) return -1;
+    /* Prefer a type we have not just played, so the deck does not serve
+       four Never Have I Evers in a row. */
+    let idx = bucket.findIndex(function (ci) {
+      return !used[ci] && recent.indexOf(DECK[ci][0]) < 0;
+    });
+    if (idx < 0) idx = bucket.findIndex(function (ci) { return !used[ci]; });
+    if (idx < 0) return -1;
+    const ci = bucket[idx];
+    bucket.splice(idx, 1);
+    used[ci] = 1;
+    return ci;
+  }
+
+  plan.forEach(function (h) {
+    let ci = take(h);
+    /* Ran that heat dry: borrow from the nearest heat we still have, staying
+       under the cap. Widen outwards rather than jumping straight to hottest. */
+    for (let d = 1; ci < 0 && d <= 4; d++) {
+      if (h - d >= 1) ci = take(h - d);
+      if (ci < 0 && h + d <= maxHeat) ci = take(h + d);
+    }
+    if (ci < 0) return;
+    order.push(ci);
+    casts.push(castFor(DECK[ci], players, pairs));
+    recent.push(DECK[ci][0]);
+    if (recent.length > 2) recent.shift();
+  });
+
+  return { order: order, casts: casts };
+}
+
+/* Rules are derived, never stored: a rule card at position j with duration d
+   is live for cards j+1 .. j+d. That keeps the synced state small and means
+   rewinding or replaying can never leave a stale rule hanging around. */
+function activeRules(order, i) {
+  const out = [];
+  for (let j = Math.max(0, i - 12); j < i; j++) {
+    const c = DECK[order[j]];
+    if (!c || c[0] !== "rule") continue;
+    const left = (j + c[3]) - i + 1;
+    if (left > 0) out.push({ text: c[2], left: left });
+  }
+  return out;
+}
+
+const nameOf = (players, id) => {
+  const p = players.filter((x) => x.id === id)[0];
+  return p ? p.name : "someone";
+};
+
+/* Render card text with the cast spliced in, names in white pills. */
+function renderText(card, cast, players) {
+  const slots = slotsOf(card[2]);
+  const map = {};
+  slots.forEach(function (s, i) { map[s] = cast[i]; });
+  const parts = card[2].split(/(\{[pqrmn]\})/g);
+  return parts.map(function (part, k) {
+    const m = /^\{([pqrmn])\}$/.exec(part);
+    if (!m) return part;
+    return <b className="nm" key={k}>{nameOf(players, map[m[1]])}</b>;
+  });
+}
+
+/* Everyone the current card is pointed at -- used to highlight chips. */
+function targetsOf(card, cast) { return cast || []; }
+
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ";   /* no I or O */
+const newCode = () => Array.from({ length: 4 },
+  () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)]).join("");
+const newId = () => Math.random().toString(36).slice(2, 10);
+
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
+const pairOf = (pairs, id) => {
+  for (const pr of pairs) {
+    if (pr[0] === id) return pr[1];
+    if (pr[1] === id) return pr[0];
+  }
+  return null;
+};
+
+/* ================================================================== *
+ *  SHARED BITS                                                        *
+ * ================================================================== */
+
+function Logo({ small }) {
+  return (
+    <div className="lb-center" style={{ marginBottom: small ? 8 : 14 }}>
+      <div className="lb-logo" style={small ? { fontSize: 40 } : null}>
+        Lab<em>ello</em>
+      </div>
+      {!small && <div className="lb-kicker" style={{ marginTop: 6 }}>
+        The night gets closer &nbsp;&#128139;
+      </div>}
+    </div>
+  );
+}
+
+function Chip({ p, onClick, selected, partner, dim }) {
+  return (
+    <button type="button"
+      className={"lb-chip c" + (p.c % 8) + (selected ? " sel" : "") + (partner ? " paired" : "")}
+      style={dim ? { opacity: .4 } : null}
+      onClick={onClick}>
+      <span className="dot">{p.name.slice(0, 1).toUpperCase()}</span>
+      {p.name}
+      {partner && <span className="heart">&#128149;</span>}
+    </button>
+  );
+}
+
+/* Tap one player, tap another, they are matched. Tap a matched player to
+   break the pair. Everything past a hug is dealt only to these couples. */
+function Matchmaker({ players, pairs, setPairs, disabled }) {
+  const [sel, setSel] = useState(null);
+
+  function tap(id) {
+    if (disabled) return;
+    const existing = pairOf(pairs, id);
+    if (existing) {
+      setPairs(pairs.filter((pr) => pr.indexOf(id) < 0));
+      setSel(null);
+      return;
+    }
+    if (sel === null) { setSel(id); return; }
+    if (sel === id) { setSel(null); return; }
+    setPairs(pairs.concat([[sel, id]]));
+    setSel(null);
+  }
+
+  return (
+    <div>
+      <div className="lb-label">
+        Matches
+        <span className="lb-badgecount">{pairs.length}</span>
+      </div>
+      <p className="lb-note" style={{ marginBottom: 10 }}>
+        Tap two people to match them. Kissing, clothing and anything past a hug
+        is dealt <b>only to matched couples</b>. Hugs and friendly dares can hit
+        anyone.
+      </p>
+      <div className="lb-chips">
+        {players.map((p) => (
+          <Chip key={p.id} p={p} selected={sel === p.id}
+            partner={!!pairOf(pairs, p.id)} onClick={() => tap(p.id)} />
+        ))}
+      </div>
+      {sel !== null && (
+        <p className="lb-note" style={{ marginTop: 10, color: "var(--violetDark)", fontWeight: 900 }}>
+          Now tap who {nameOf(players, sel)} is matched with.
+        </p>
+      )}
+      {pairs.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          {pairs.map((pr, i) => (
+            <div className="lb-pair" key={i}>
+              <span>&#128139;</span>
+              <span className="who">{nameOf(players, pr[0])} &nbsp;+&nbsp; {nameOf(players, pr[1])}</span>
+              {!disabled && <button onClick={() => setPairs(pairs.filter((_, k) => k !== i))}>&#10005;</button>}
+            </div>
+          ))}
+        </div>
+      )}
+      {pairs.length === 0 && (
+        <div className="lb-warn" style={{ marginTop: 12 }}>
+          No matches yet. That is fine &mdash; the game just skips every kissing
+          and clothing card and stays at hugs and dares.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Settings({ cfg, setCfg, pairs, players }) {
+  const pool = poolSize(players, pairs, cfg.maxHeat);
+  const short = pool < cfg.len;
+  return (
+    <div>
+      <div className="lb-label">Length</div>
+      <div className="lb-seg">
+        {LENGTHS.map((L) => (
+          <button key={L.k} className={cfg.len === L.n ? "on" : ""}
+            onClick={() => setCfg({ ...cfg, len: L.n })}>
+            {L.label}<br /><small style={{ fontSize: 11, opacity: .75 }}>{L.d}</small>
+          </button>
+        ))}
+      </div>
+
+      <div className="lb-label" style={{ marginTop: 18 }}>How far it goes</div>
+      <div className="lb-seg heat">
+        {[1, 2, 3, 4, 5].map((h) => (
+          <button key={h} className={cfg.maxHeat === h ? "on" : ""}
+            onClick={() => setCfg({ ...cfg, maxHeat: h })}>{h}</button>
+        ))}
+      </div>
+      <p className="lb-note" style={{ marginTop: 8 }}>
+        <b style={{ color: "var(--pinkDark)" }}>{HEATS[cfg.maxHeat]}</b> &mdash; {HEAT_BLURB[cfg.maxHeat]}
+        {cfg.maxHeat >= 3 && pairs.length === 0 &&
+          <span> With no matches set, those cards are left in the box.</span>}
+      </p>
+      {short && (
+        <div className="lb-warn" style={{ marginTop: 12 }}>
+          Only <b>{pool}</b> cards fit these settings, so the game will end there
+          instead of at {cfg.len}. Raise the level or pick a shorter game.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  HOME                                                               *
+ * ================================================================== */
+
+function Home({ onSolo, onCreate, onJoin, online }) {
+  return (
+    <div>
+      <div style={{ height: 12 }} />
+      <Logo />
+      <p className="lb-sub lb-center" style={{ margin: "0 auto 22px", maxWidth: 380 }}>
+        A drinking game that starts silly and does not stay that way.
+        Match people up first &mdash; the game respects it.
+      </p>
+
+      <button className="lb-big" onClick={onSolo}>
+        <span className="t">&#128241; &nbsp;One phone</span>
+        <span className="d">Everyone huddles round a single screen. Nothing to set up.</span>
+      </button>
+
+      <button className="lb-big violet" onClick={onCreate} disabled={!online}>
+        <span className="t">&#127881; &nbsp;Host a room</span>
+        <span className="d">
+          {online ? "Everyone joins on their own phone and sees the same card."
+                  : "Needs Firebase set up — see the README."}
+        </span>
+      </button>
+
+      <button className="lb-big gold" onClick={onJoin} disabled={!online}>
+        <span className="t">&#128273; &nbsp;Join a room</span>
+        <span className="d">Got a four-letter code? In you go.</span>
+      </button>
+
+      <div className="lb-card" style={{ marginTop: 20 }}>
+        <h3>House rules</h3>
+        <hr className="lb-hair" />
+        <p className="lb-note">
+          <b>Skip is free.</b> Every card has a Pass button and nobody is allowed
+          to make it weird. <br /><br />
+          <b>Matches are the boundary.</b> Anything past a hug only ever lands on
+          two people the host matched. <br /><br />
+          <b>18+.</b> Drink water, know your limits, and let someone sober hold the phone.
+        </p>
+      </div>
+      <p className="lb-tiny lb-center" style={{ marginTop: 18 }}>
+        {DECK.length} cards &middot; build {BUILD}
+      </p>
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  LOBBY  (both single-phone setup and online room)                   *
+ * ================================================================== */
+
+function Lobby({ st, setSt, solo, code, meId, isHost, presence, onStart, onLeave }) {
+  const [nm, setNm] = useState("");
+  const players = st.players, pairs = st.pairs, cfg = st.cfg;
+  const qrRef = useRef(null);
+
+  const joinUrl = code
+    ? location.origin + location.pathname + "#" + code
+    : null;
+
+  useEffect(() => {
+    if (!joinUrl || !qrRef.current || typeof qrcode !== "function") return;
+    try {
+      const q = qrcode(0, "M");
+      q.addData(joinUrl);
+      q.make();
+      qrRef.current.innerHTML = q.createImgTag(5, 8);
+    } catch (e) { /* QR is a nicety; the code still works */ }
+  }, [joinUrl]);
+
+  function addPlayer() {
+    const n = nm.trim().slice(0, 14);
+    if (!n || players.length >= 16) return;
+    setSt({ ...st, players: players.concat([{ id: newId(), name: n, c: players.length % 8 }]) });
+    setNm("");
+  }
+  function removePlayer(id) {
+    setSt({
+      ...st,
+      players: players.filter((p) => p.id !== id),
+      pairs: pairs.filter((pr) => pr.indexOf(id) < 0)
+    });
+  }
+
+  const enough = players.length >= 2;
+  const canEdit = solo || isHost;
+
+  return (
+    <div>
+      <Logo small />
+
+      {code && (
+        <div className="lb-card">
+          <div className="lb-codebox">
+            <div className="lb-kicker">Room code</div>
+            <div className="code">{code}</div>
+          </div>
+          <div className="lb-qr" ref={qrRef} />
+          <p className="lb-note lb-center">
+            Scan, or send them <b>{joinUrl}</b>
+          </p>
+        </div>
+      )}
+
+      <div className="lb-card">
+        <h3>Who is playing{players.length ? " " : ""}
+          <span className="lb-badgecount">{players.length}</span></h3>
+        <hr className="lb-hair" />
+
+        {solo && (
+          <div className="lb-row" style={{ marginBottom: 12 }}>
+            <input className="lb-input" placeholder="Name" value={nm} maxLength={14}
+              onChange={(e) => setNm(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addPlayer()} />
+            <button className="lb-btn sm" style={{ flex: "0 0 auto" }}
+              onClick={addPlayer} disabled={!nm.trim()}>Add</button>
+          </div>
+        )}
+
+        {players.length === 0 && <div className="lb-empty">
+          {solo ? "Add everyone in the room." : "Waiting for people to join…"}
+        </div>}
+
+        <div className="lb-chips">
+          {players.map((p) => (
+            <Chip key={p.id} p={p}
+              partner={!!pairOf(pairs, p.id)}
+              dim={!!code && !presence[p.id] && p.id !== meId}
+              onClick={() => solo && removePlayer(p.id)} />
+          ))}
+        </div>
+        {solo && players.length > 0 &&
+          <p className="lb-note" style={{ marginTop: 10 }}>Tap a name to remove them.</p>}
+        {code && <p className="lb-note" style={{ marginTop: 10 }}>Faded names are phones that dropped off.</p>}
+      </div>
+
+      {canEdit ? (
+        <>
+          <div className="lb-card">
+            <Matchmaker players={players} pairs={pairs}
+              setPairs={(pr) => setSt({ ...st, pairs: pr })} />
+          </div>
+
+          <div className="lb-card">
+            <Settings cfg={cfg} setCfg={(c) => setSt({ ...st, cfg: c })}
+              pairs={pairs} players={players} />
+          </div>
+
+          <div style={{ marginTop: 16 }}>
+            <button className="lb-btn violet" onClick={onStart} disabled={!enough}>
+              {enough ? "Start the night →" : "Need at least 2 players"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="lb-card lb-dead">
+          <div className="lb-blob">&#127864;</div>
+          <h3 style={{ marginTop: 10 }}>You are in.</h3>
+          <p className="lb-note" style={{ marginTop: 8 }}>
+            {nameOf(players, st.host)} is setting up the matches. Hold tight.
+          </p>
+          {pairOf(pairs, meId) && (
+            <div className="lb-pair" style={{ marginTop: 14, justifyContent: "center" }}>
+              <span>&#128139;</span>
+              <span className="who" style={{ flex: "0 0 auto" }}>
+                You are matched with {nameOf(players, pairOf(pairs, meId))}
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ marginTop: 12 }}>
+        <button className="lb-btn ghost" onClick={onLeave}>
+          {solo ? "Back" : "Leave room"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  PLAY                                                               *
+ * ================================================================== */
+
+function Play({ st, meId, onNext, onPass, onQuit }) {
+  const i = st.i;
+  const card = DECK[st.order[i]];
+  const cast = st.casts[i] || [];
+  if (!card) return null;
+
+  const heat = card[1];
+  const meta = TYPES[card[0]];
+  const rules = activeRules(st.order, i);
+  const onMe = meId && cast.indexOf(meId) >= 0;
+  const isPairCard = slotsOf(card[2]).indexOf("m") >= 0;
+
+  return (
+    <div>
+      <div className="lb-hud" style={{ marginBottom: 6 }}>
+        <button className="lb-btn ghost sm" style={{ flex: "0 0 auto", padding: "7px 11px" }}
+          onClick={onQuit}>&#10005;</button>
+        <div className="lb-meter">
+          {[1, 2, 3, 4, 5].map((k) => (
+            <i key={k} className={k <= heat ? "on" + k : ""} />
+          ))}
+        </div>
+        <div className="lb-count">{i + 1}/{st.order.length}</div>
+      </div>
+      <div className="lb-heatname lb-center" style={{ marginBottom: 10 }}>{HEATS[heat]}</div>
+
+      {rules.length > 0 && (
+        <div className="lb-rules">
+          {rules.map((r, k) => (
+            <div className="r" key={k}>
+              <span className="n">{r.left}</span>
+              <span>&#128220; {r.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="lb-stage">
+        <div className={"lb-face h" + heat} onClick={onNext} key={i}>
+          <span className="badge">
+            <span className="e">{meta.e}</span>{meta.label}
+          </span>
+          <div className="txt">
+            <span>{renderText(card, cast, st.players)}</span>
+          </div>
+          <div className="foot">
+            <span>
+              {isPairCard ? "\u{1F495} matched only"
+                : onMe ? "\u{1F449} that is you"
+                : ""}
+            </span>
+            <span className="tap">tap for next &#8594;</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="lb-row">
+        <button className="lb-btn ghost" onClick={onPass}>Pass</button>
+        <button className="lb-btn" style={{ flex: 2 }} onClick={onNext}>Next &#8594;</button>
+      </div>
+      <p className="lb-note lb-center" style={{ marginTop: 10 }}>
+        Passing costs nothing. Take a sip if you feel like it.
+      </p>
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  THE END                                                            *
+ * ================================================================== */
+
+function End({ st, onAgain, onHome, canRestart }) {
+  const played = st.order.length;
+  const skipped = (st.skips || []).length;
+  return (
+    <div>
+      <div style={{ height: 20 }} />
+      <div className="lb-center">
+        <div className="lb-blob">&#128139;</div>
+        <h1 style={{ fontSize: 44, color: "var(--pink)", marginTop: 8 }}>That is a wrap</h1>
+        <p className="lb-sub" style={{ marginTop: 10 }}>
+          {skipped === 0
+            ? "Not a single pass. Reckless. Respect."
+            : skipped === 1 ? "One pass all night. Nearly flawless."
+            : "" + skipped + " cards passed. Cowards, all of you."}
+        </p>
+      </div>
+
+      <div className="lb-card" style={{ marginTop: 20 }}>
+        <h3>Tonight</h3>
+        <hr className="lb-hair" />
+        <p className="lb-note">
+          <b>{played}</b> cards played, peaking at <b>{HEATS[st.cfg.maxHeat]}</b>.<br />
+          <b>{st.players.length}</b> players, <b>{st.pairs.length}</b> matched
+          {st.pairs.length ? ": " + st.pairs.map((pr) =>
+            nameOf(st.players, pr[0]) + " + " + nameOf(st.players, pr[1])).join(", ") : ""}.<br />
+          There are <b>{DECK.length - played}</b> cards you have not seen yet.
+        </p>
+      </div>
+
+      {canRestart && (
+        <div style={{ marginTop: 16 }}>
+          <button className="lb-btn violet" onClick={onAgain}>Another round &#8594;</button>
+        </div>
+      )}
+      <div style={{ marginTop: 10 }}>
+        <button className="lb-btn ghost" onClick={onHome}>Back to the start</button>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  ENTRY SCREENS                                                      *
+ * ================================================================== */
+
+function Gate({ onOk }) {
+  return (
+    <div>
+      <div style={{ height: 30 }} />
+      <Logo />
+      <div className="lb-card" style={{ marginTop: 18 }}>
+        <h3>Before we start</h3>
+        <hr className="lb-hair" />
+        <p className="lb-note">
+          Labello is an adults-only party game. It asks personal questions and,
+          later on, involves kissing and clothing between people the host has
+          matched.<br /><br />
+          Every card can be passed, no penalty and no argument. If anyone is not
+          up for it, that is the end of it. Look after each other and drink water.
+        </p>
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <button className="lb-btn" onClick={onOk}>
+          Everyone here is 18+ and up for it
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NameAsk({ title, blurb, needCode, initialCode, cta, busy, err, onGo, onBack }) {
+  const [name, setName] = useState(() => LS.get("lb:name", ""));
+  const [code, setCode] = useState(initialCode || "");
+  const ok = name.trim().length > 0 && (!needCode || code.trim().length === 4);
+
+  function go() {
+    if (!ok || busy) return;
+    LS.set("lb:name", name.trim().slice(0, 14));
+    onGo(name.trim().slice(0, 14), code.trim().toUpperCase());
+  }
+
+  return (
+    <div>
+      <div style={{ height: 16 }} />
+      <Logo small />
+      <div className="lb-card">
+        <h3>{title}</h3>
+        <hr className="lb-hair" />
+        <p className="lb-note" style={{ marginBottom: 14 }}>{blurb}</p>
+
+        {needCode && (
+          <>
+            <div className="lb-label">Room code</div>
+            <input className="lb-input lb-code-in" value={code} maxLength={4}
+              autoCapitalize="characters" autoCorrect="off" spellCheck="false"
+              placeholder="&middot;&middot;&middot;&middot;"
+              onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z]/g, ""))} />
+            <div style={{ height: 14 }} />
+          </>
+        )}
+
+        <div className="lb-label">Your name</div>
+        <input className="lb-input" value={name} maxLength={14} placeholder="What do they call you?"
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && go()} />
+
+        {err && <div className="lb-warn" style={{ marginTop: 14 }}>{err}</div>}
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <button className="lb-btn violet" onClick={go} disabled={!ok || busy}>
+          {busy ? "One sec…" : cta}
+        </button>
+      </div>
+      <div style={{ marginTop: 10 }}>
+        <button className="lb-btn ghost" onClick={onBack}>Back</button>
+      </div>
+    </div>
+  );
+}
+
+/* ================================================================== *
+ *  APP                                                                *
+ * ================================================================== */
+
+function freshState(hostId) {
+  return {
+    v: 1, phase: "lobby",
+    players: [], pairs: [],
+    cfg: { len: 40, maxHeat: 5 },
+    order: [], casts: [], i: 0, skips: [],
+    host: hostId || null, ts: Date.now()
+  };
+}
+
+function App() {
+  const [gate, setGate]     = useState(() => LS.get("lb:gate", false));
+  const [route, setRoute]   = useState("home");     /* home | create | join */
+  const [code, setCode]     = useState(null);       /* null => single phone  */
+  const [meId, setMeId]     = useState(null);
+  const [st, setStRaw]      = useState(null);
+  const [presence, setPres] = useState({});
+  const [busy, setBusy]     = useState(false);
+  const [err, setErr]       = useState(null);
+  const [hashCode, setHash] = useState("");
+
+  const online = LBSync.available();
+  const solo   = !code;
+  const stRef  = useRef(null);
+  stRef.current = st;
+
+  /* A shared link lands on #ABCD -- jump straight to the join screen. */
+  useEffect(() => {
+    const h = (location.hash || "").replace("#", "").toUpperCase().replace(/[^A-Z]/g, "");
+    if (h.length === 4) { setHash(h); if (online) setRoute("join"); }
+  }, []); // eslint-disable-line
+
+  /* Live room state + who is currently connected. */
+  useEffect(() => {
+    if (!code) return;
+    const offState = LBSync.subscribe(code, (s) => { if (s) setStRaw(s); });
+    const offPres  = LBSync.watchPresence(code, setPres);
+    return () => { offState(); offPres(); };
+  }, [code]);
+
+  useEffect(() => {
+    if (!code || !meId) return;
+    const me = (stRef.current && stRef.current.players.filter((p) => p.id === meId)[0]) || null;
+    return LBSync.presence(code, meId, me ? me.name : "?");
+  }, [code, meId]);
+
+  const commit = useCallback((next) => {
+    next.ts = Date.now();
+    setStRaw(next);
+    if (code) LBSync.write(code, next);
+  }, [code]);
+
+  /* ---- room lifecycle ---- */
+  function createRoom(name) {
+    setBusy(true); setErr(null);
+    const rc = newCode(), id = newId();
+    const s = freshState(id);
+    s.players = [{ id: id, name: name, c: 0 }];
+    LBSync.create(rc, s).then((ok) => {
+      setBusy(false);
+      if (!ok) { setErr("Could not reach the database. Check the Firebase setup in the README."); return; }
+      LS.set("lb:seat:" + rc, { id: id, name: name });
+      setMeId(id); setCode(rc); setStRaw(s); setRoute("home");
+    });
+  }
+
+  function joinRoom(name, rc) {
+    setBusy(true); setErr(null);
+    const seat = LS.get("lb:seat:" + rc, null);
+    const id = (seat && seat.id) || newId();
+    LBSync.join(rc, { id: id, name: name, c: 0 }).then((res) => {
+      setBusy(false);
+      if (!res.room) { setErr("No room with the code " + rc + "."); return; }
+      if (!res.ok) {
+        /* The join transaction aborts once a game is running, but rejoining
+           your own seat after a refresh has to keep working. */
+        const mine = res.room.players.filter((p) => p.id === id)[0];
+        if (mine) {
+          LS.set("lb:seat:" + rc, { id: id, name: mine.name });
+          setMeId(id); setCode(rc); setStRaw(res.room); setRoute("home");
+          return;
+        }
+        setErr(res.room.phase !== "lobby"
+          ? "That game has already started without you."
+          : "That room is full.");
+        return;
+      }
+      LS.set("lb:seat:" + rc, { id: id, name: name });
+      setMeId(id); setCode(rc); setStRaw(res.room); setRoute("home");
+    });
+  }
+
+  function leave() {
+    setCode(null); setMeId(null); setStRaw(null); setPres({});
+    setRoute("home"); setErr(null);
+    if (location.hash) history.replaceState(null, "", location.pathname);
+  }
+
+  /* ---- gameplay ---- */
+  function start() {
+    const s = stRef.current;
+    const g = buildGame(s.players, s.pairs, s.cfg.len, s.cfg.maxHeat);
+    if (!g.order.length) { setErr("Could not deal a game from that setup."); return; }
+    commit({ ...s, phase: "play", order: g.order, casts: g.casts, i: 0, skips: [] });
+  }
+
+  function advance(pass) {
+    const s = stRef.current;
+    if (!s || s.phase !== "play") return;
+    const seen = s.i;
+    const apply = (x) => {
+      const ni = x.i + 1;
+      return {
+        ...x,
+        i: ni,
+        skips: pass ? (x.skips || []).concat([x.i]) : (x.skips || []),
+        phase: ni >= x.order.length ? "end" : "play",
+        ts: Date.now()
+      };
+    };
+    if (code) {
+      /* Compare-and-swap on the index we actually looked at, so four people
+         tapping the same card only moves the game on once. */
+      LBSync.tx(code, (cur) => {
+        if (!cur || cur.phase !== "play" || cur.i !== seen) return undefined;
+        return apply(cur);
+      });
+    } else {
+      setStRaw(apply(s));
+    }
+  }
+
+  function quit() {
+    const s = stRef.current;
+    const host = solo || (s && s.host === meId);
+    if (!host) { leave(); return; }
+    if (!confirm("End the game and go back to the lobby?")) return;
+    commit({ ...s, phase: "lobby", order: [], casts: [], i: 0, skips: [] });
+  }
+
+  /* ---- render ---- */
+  const S = <style>{CSS}</style>;
+  const shell = (kids) => <div className="lb">{S}<div className="lb-wrap">{kids}</div></div>;
+
+  if (!gate) return shell(
+    <Gate onOk={() => { LS.set("lb:gate", true); setGate(true); }} />
+  );
+
+  if (route === "create") return shell(
+    <NameAsk title="Host a room" cta="Create the room" busy={busy} err={err}
+      blurb="You will get a four-letter code. Everyone else joins with it, and you decide the matches."
+      onGo={(n) => createRoom(n)} onBack={() => { setRoute("home"); setErr(null); }} />
+  );
+
+  if (route === "join") return shell(
+    <NameAsk title="Join a room" cta="Join" needCode initialCode={hashCode} busy={busy} err={err}
+      blurb="Ask the host for the code, or scan the QR on their screen."
+      onGo={(n, c) => joinRoom(n, c)} onBack={() => { setRoute("home"); setErr(null); }} />
+  );
+
+  if (!st) return shell(
+    <Home online={online}
+      onSolo={() => setStRaw(freshState(null))}
+      onCreate={() => setRoute("create")}
+      onJoin={() => setRoute("join")} />
+  );
+
+  const isHost = solo || st.host === meId;
+
+  if (st.phase === "lobby") return shell(
+    <>
+      <Lobby st={st} setSt={commit} solo={solo} code={code} meId={meId}
+        isHost={isHost} presence={presence} onStart={start} onLeave={leave} />
+      {err && <div className="lb-warn" style={{ marginTop: 14 }}>{err}</div>}
+    </>
+  );
+
+  if (st.phase === "play") return shell(
+    <Play st={st} meId={meId}
+      onNext={() => advance(false)} onPass={() => advance(true)} onQuit={quit} />
+  );
+
+  return shell(
+    <End st={st} canRestart={isHost}
+      onAgain={() => commit({ ...st, phase: "lobby", order: [], casts: [], i: 0, skips: [] })}
+      onHome={leave} />
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
